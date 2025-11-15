@@ -1,0 +1,833 @@
+<!DOCTYPE html>
+<html lang="cs">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Audio stream + playlist přes WebRTC s PeerJS a synchronizací</title>
+<style>
+  body { font-family: Arial, sans-serif; margin: 20px; background: #121212; color: #eee; }
+  h1 { margin-bottom: 10px; }
+  label, select, button, input { font-size: 1.1em; margin-top: 10px; display: block; }
+  #senderUI, #receiverUI { margin-top: 20px; }
+  audio { margin-top: 10px; width: 100%; outline: none; border-radius: 6px; background: #222; }
+  button { padding: 10px 20px; background: #0b84ff; border: none; border-radius: 6px; color: white; cursor: pointer; margin-right: 5px; }
+  button:disabled { background: #555; cursor: not-allowed; }
+  #status { margin-top: 15px; font-weight: bold; min-height: 1.5em; color: #bcd; }
+  #playlist { margin-top: 10px; max-height: 200px; overflow-y: auto; border: 1px solid #555; padding: 5px; }
+  #playlist li { cursor: pointer; padding: 5px; }
+  #playlist li.active { background: #0b84ff; color: #000; }
+  #controls { margin-top: 10px; }
+  #peerIdInput, #senderPeerIdInput { width: 300px; padding: 5px; margin-top: 10px; background: #222; border: 1px solid #444; color: #eee; border-radius: 4px; }
+  #unmuteBtn { background: #ff0b3c !important; display: none; margin: 15px auto; padding: 15px 30px; font-size: 1.2em; font-weight: bold; }
+  #qrcodeContainer { background: white; padding: 10px; border-radius: 8px; display: inline-block; margin-top: 15px; }
+  #peerIdDisplay { font-weight: bold; margin-bottom: 5px; color: #222; }
+  #readerContainer { margin-top: 15px; display: flex; justify-content: center; }
+  #pasteIdBtn, #copyIdBtn { margin-left: 10px; display: inline-block; }
+  .small { font-size: 0.9em; color: #999; margin-top: 6px; }
+</style>
+</head>
+<body>
+  <h1>Audio stream + playlist přes WebRTC s PeerJS a synchronizací</h1>
+
+  <label for="role">Vyber roli:</label>
+  <select id="role">
+    <option value="sender">Vysílač (stream audio)</option>
+    <option value="receiver">Přijímač (poslech)</option>
+  </select>
+
+  <div id="senderUI" style="display:none;">
+    <h2>Vysílač</h2>
+
+    <input type="text" id="streamUrlInput" placeholder="Zadejte URL streamu (Icecast / mp3 / m3u8)"/>
+    <button id="addUrlToPlaylistBtn">Přidat URL do playlistu (zkusí CORS proxy)</button>
+
+    <hr style="border-color:#333; margin: 15px 0;">
+
+    <input type="file" id="audioFileInput" accept="audio/*" multiple />
+    <button id="addToPlaylistBtn" disabled>Přidat soubor(y) do playlistu</button>
+    <ul id="playlist"></ul>
+    <button id="startPlaylistBtn" disabled>Start přehrávání playlistu</button>
+    <audio id="audioSource" controls></audio>
+
+    <div id="controls" style="margin-top:5px;">
+      <button id="prevBtn" disabled>Předchozí (Lokální)</button>
+      <button id="playBtn" disabled>Play (Lokální)</button>
+      <button id="pauseBtn" disabled>Pauza (Lokální)</button>
+      <button id="nextBtn" disabled>Další (Lokální)</button>
+    </div>
+
+    <hr style="border-color:#333; margin: 15px 0;">
+    <h3>Konfigurace TURN Serveru (volitelné)</h3>
+    <p class="small">Vlož vlastní TURN pokud chceš spolehlivější NAT prolomení.</p>
+    <input type="text" id="turnUrlInput" placeholder="TURN URL (např. turn:vas.server.com:3478)" />
+    <input type="text" id="turnUsernameInput" placeholder="TURN uživatel" />
+    <input type="password" id="turnCredentialInput" placeholder="TURN heslo/kredenciál" />
+
+    <p class="small">Peer ID (zadej vlastní nebo nech prázdné a nech vygenerovat):</p>
+    <input id="senderPeerIdInput" type="text" placeholder="Peer ID vysílače (volitelné)" />
+    <button id="initPeerBtn">Inicializovat Peer (vysílač)</button>
+
+    <div id="qrcodeContainer" style="display:none;">
+        <p id="peerIdDisplay"></p>
+        <div id="qrcode"></div>
+        <button id="copyIdBtn" style="margin-top: 10px; background: #28a745;">Kopírovat ID</button>
+    </div>
+  </div>
+
+  <div id="receiverUI" style="display:none;">
+    <h2>Přijímač</h2>
+    <input type="text" id="peerIdInput" placeholder="Zadej Peer ID vysílače" />
+    <button id="connectBtn">Připojit</button>
+    <button id="pasteIdBtn" style="margin-top: 15px; background: #007bff;">Vložit ID ze schránky</button>
+
+    <button id="scanQrBtn" style="margin-top: 15px;">Skenovat QR kód</button>
+    <div id="readerContainer"><div id="reader"></div></div>
+
+    <div id="autoplayBlocker" style="text-align: center;">
+        <button id="unmuteBtn">KLIKNĚTE PRO POVOLENÍ ZVUKU</button>
+    </div>
+
+    <audio id="audioReceiver" controls autoplay></audio>
+    <div id="controlsReceiver" style="margin-top:5px;">
+      <button id="prevBtnR" disabled>Předchozí</button>
+      <button id="playBtnR" disabled>Play</button>
+      <button id="pauseBtnR" disabled>Pauza</button>
+      <button id="nextBtnR" disabled>Další</button>
+    </div>
+  </div>
+
+  <div id="status"></div>
+
+  <!-- Závislosti -->
+  <script src="https://cdn.jsdelivr.net/npm/peerjs@1.4.7/dist/peerjs.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+  <script src="https://unpkg.com/html5-qrcode"></script>
+
+  <script>
+  (function(){
+    // --- Konstanty pro localStorage ---
+    const SENDER_ID_KEY = 'webrtc_sender_peer_id';
+    const PLAYLIST_KEY = 'webrtc_playlist';
+    const TURN_URL_KEY = 'webrtc_turn_url';
+    const TURN_USERNAME_KEY = 'webrtc_turn_username';
+    const TURN_CREDENTIAL_KEY = 'webrtc_turn_credential';
+
+    // --- Elementy UI ---
+    const roleSelect = document.getElementById('role');
+    const senderUI = document.getElementById('senderUI');
+    const receiverUI = document.getElementById('receiverUI');
+    const audioFileInput = document.getElementById('audioFileInput');
+    const addToPlaylistBtn = document.getElementById('addToPlaylistBtn');
+    const playlistEl = document.getElementById('playlist');
+    const startPlaylistBtn = document.getElementById('startPlaylistBtn');
+    const audioSource = document.getElementById('audioSource');
+    const audioReceiver = document.getElementById('audioReceiver');
+    const statusDiv = document.getElementById('status');
+    const senderPeerIdInput = document.getElementById('senderPeerIdInput');
+    const initPeerBtn = document.getElementById('initPeerBtn');
+    const peerIdInput = document.getElementById('peerIdInput');
+    const connectBtn = document.getElementById('connectBtn');
+    const streamUrlInput = document.getElementById('streamUrlInput');
+    const addUrlToPlaylistBtn = document.getElementById('addUrlToPlaylistBtn');
+    const unmuteBtn = document.getElementById('unmuteBtn');
+    const qrcodeContainer = document.getElementById('qrcodeContainer');
+    const peerIdDisplay = document.getElementById('peerIdDisplay');
+    const scanQrBtn = document.getElementById('scanQrBtn');
+    const readerContainer = document.getElementById('readerContainer');
+    const copyIdBtn = document.getElementById('copyIdBtn');
+    const pasteIdBtn = document.getElementById('pasteIdBtn');
+    const turnUrlInput = document.getElementById('turnUrlInput');
+    const turnUsernameInput = document.getElementById('turnUsernameInput');
+    const turnCredentialInput = document.getElementById('turnCredentialInput');
+
+    const prevBtn = document.getElementById('prevBtn');
+    const playBtn = document.getElementById('playBtn');
+    const pauseBtn = document.getElementById('pauseBtn');
+    const nextBtn = document.getElementById('nextBtn');
+    const prevBtnR = document.getElementById('prevBtnR');
+    const playBtnR = document.getElementById('playBtnR');
+    const pauseBtnR = document.getElementById('pauseBtnR');
+    const nextBtnR = document.getElementById('nextBtnR');
+
+    // --- Proxy pro externí URL testy ---
+    const PROXIES = [
+      'https://corsproxy.io/?',
+      'https://api.allorigins.win/raw?url=',
+      'https://thingproxy.freeboard.io/fetch/',
+    ];
+
+    // --- Stav ---
+    let peerJs = null;
+    let conn = null; // DataConnection
+    let mediaConn = null; // MediaConnection (call)
+    let audioStreamSource = null;
+    let audioContext = null;
+    let sourceNode = null;
+    let destNode = null;
+    let playlist = [];
+    let currentTrackIndex = -1;
+    let peerIndex = 0;
+    let html5QrCode = null;
+
+    // --- Utility ---
+    function logStatus(msg) {
+      statusDiv.textContent = msg;
+      console.log(msg);
+    }
+
+    // --- ICE / TURN konfigurace ---
+    function getIceConfig() {
+      const customUrl = turnUrlInput.value.trim();
+      const customUsername = turnUsernameInput.value.trim();
+      const customCredential = turnCredentialInput.value.trim();
+
+      const iceServers = [
+        { urls: 'stun:stun.l.google.com:19302' },
+        { urls: 'stun:stun1.l.google.com:19302' },
+        { urls: 'stun:stun.services.mozilla.com:3478' },
+        { urls: 'stun:stun.stunprotocol.org' },
+      ];
+
+      if (customUrl && customUsername && customCredential) {
+        iceServers.push({
+          urls: customUrl,
+          username: customUsername,
+          credential: customCredential
+        });
+      }
+
+      iceServers.push(
+        { urls: 'turn:openrelay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
+        { urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' },
+        { urls: 'turn:openrelay.metered.ca:3478', username: 'openrelayproject', credential: 'openrelayproject' }
+      );
+
+      return { iceTransportPolicy: 'relay', iceServers: iceServers };
+    }
+
+    // --- Local storage functions ---
+    function savePlaylistToLocal() {
+      try {
+        const serializablePlaylist = playlist.filter(track => !track.url || !track.url.startsWith('blob:'));
+        localStorage.setItem(PLAYLIST_KEY, JSON.stringify(serializablePlaylist));
+        logStatus('Playlist uložen do localStorage.');
+      } catch (e) {
+        console.error('Chyba při ukládání playlistu:', e);
+      }
+    }
+
+    function loadPlaylistFromLocal() {
+      try {
+        const stored = localStorage.getItem(PLAYLIST_KEY);
+        if (stored) {
+          playlist = JSON.parse(stored);
+          updatePlaylistUI();
+          logStatus('Playlist načten z localStorage.');
+        }
+      } catch (e) {
+        console.error('Chyba při načítání playlistu:', e);
+      }
+
+      const storedSenderId = localStorage.getItem(SENDER_ID_KEY);
+      if (storedSenderId) senderPeerIdInput.value = storedSenderId;
+
+      turnUrlInput.value = localStorage.getItem(TURN_URL_KEY) || '';
+      turnUsernameInput.value = localStorage.getItem(TURN_USERNAME_KEY) || '';
+      turnCredentialInput.value = localStorage.getItem(TURN_CREDENTIAL_KEY) || '';
+      if (turnUrlInput.value) logStatus('TURN konfigurace načtena z localStorage.');
+    }
+
+    function saveTurnCredentials() {
+      localStorage.setItem(TURN_URL_KEY, turnUrlInput.value.trim());
+      localStorage.setItem(TURN_USERNAME_KEY, turnUsernameInput.value.trim());
+      localStorage.setItem(TURN_CREDENTIAL_KEY, turnCredentialInput.value.trim());
+      logStatus('TURN kredenciály uloženy do localStorage.');
+    }
+
+    // --- UI helpers ---
+    function showUI(role) {
+      if (role === 'sender') {
+        senderUI.style.display = 'block';
+        receiverUI.style.display = 'none';
+        qrcodeContainer.style.display = 'none';
+        unmuteBtn.style.display = 'none';
+      } else {
+        senderUI.style.display = 'none';
+        receiverUI.style.display = 'block';
+      }
+    }
+
+    function updatePlaylistUI() {
+      playlistEl.innerHTML = '';
+      playlist.forEach((t, i) => {
+        const li = document.createElement('li');
+        li.textContent = t.name || (t.url || 'track ' + i);
+        if (i === currentTrackIndex) li.classList.add('active');
+        li.onclick = () => {
+          if (roleSelect.value === 'sender') {
+            stopMediaStream(false);
+            playTrack(i);
+            sendTrackIndex(i, 0);
+            startMediaStream();
+          }
+        };
+        playlistEl.appendChild(li);
+      });
+
+      const enabled = playlist.length > 0;
+      startPlaylistBtn.disabled = !enabled;
+      prevBtn.disabled = !enabled;
+      playBtn.disabled = !enabled;
+      pauseBtn.disabled = !enabled;
+      nextBtn.disabled = !enabled;
+      updateReceiverControls(false);
+    }
+
+    // --- Playlist playback (sender local source used to create stream) ---
+    function playTrack(index, currentTime = 0) {
+      if (index < 0 || index >= playlist.length) return;
+      currentTrackIndex = index;
+      const track = playlist[index];
+      audioSource.crossOrigin = track.url && !track.url.startsWith('blob:') ? "anonymous" : null;
+      audioSource.src = track.url || '';
+      audioSource.currentTime = currentTime;
+      audioSource.pause();
+      audioSource.load();
+      updatePlaylistUI();
+    }
+
+    function setRemoteTrackIndex(index, currentTime = 0) {
+      if (index < 0 || index >= playlist.length) return;
+      currentTrackIndex = index;
+      updatePlaylistUI();
+      // Receiver may be playing media stream (WebRTC); if audioReceiver playing mediaElement (non-stream) handle accordingly
+      try { audioReceiver.currentTime = currentTime; } catch (e) {}
+      if (audioReceiver.paused) {
+        audioReceiver.play().catch(() => {});
+      }
+      updateReceiverControls(!audioReceiver.paused);
+    }
+
+    // --- SDP tweak helper ---
+    function modifySdpForOpus96(sdp) {
+      return sdp.replace(/a=fmtp:111 minptime=10;useinbandfec=1/g,
+        'a=fmtp:111 minptime=10;useinbandfec=1;maxaveragebitrate=96000;');
+    }
+
+    // --- Start/Stop media stream (sender) ---
+    function startMediaStream() {
+      if (!conn || !conn.open) {
+        logStatus('Nelze streamovat — příjemce není připojen.');
+        return;
+      }
+      if (mediaConn) {
+        logStatus('Stream již běží.');
+        return;
+      }
+
+      audioSource.play().catch(err => {
+        logStatus('Lokální přehrávání zablokováno: ' + (err && err.message ? err.message : err));
+        return;
+      });
+
+      setTimeout(() => {
+        try {
+          if (!audioContext) audioContext = new (window.AudioContext || window.webkitAudioContext)();
+          if (audioContext.state === 'suspended') audioContext.resume();
+
+          if (sourceNode) try { sourceNode.disconnect(); } catch(e){}
+          if (destNode) try { destNode.disconnect(); } catch(e){}
+
+          sourceNode = audioContext.createMediaElementSource(audioSource);
+          destNode = audioContext.createMediaStreamDestination();
+
+          sourceNode.connect(destNode);
+          sourceNode.connect(audioContext.destination);
+
+          audioStreamSource = destNode.stream;
+
+          mediaConn = peerJs.call(conn.peer, audioStreamSource);
+
+          mediaConn.on('negotiationneeded', () => {
+            const pc = mediaConn.peerConnection;
+            if (pc) {
+              const originalCreateOffer = pc.createOffer.bind(pc);
+              pc.createOffer = function() {
+                return originalCreateOffer().then(offer => {
+                  offer.sdp = modifySdpForOpus96(offer.sdp);
+                  return offer;
+                });
+              };
+            }
+          });
+
+          if (mediaConn.peerConnection) {
+            mediaConn.peerConnection.oniceconnectionstatechange = () => {
+              logStatus('ICE Stav MediaConn (Vysílač): ' + mediaConn.peerConnection.iceConnectionState);
+            };
+          }
+
+          mediaConn.on('close', stopMediaStream);
+          mediaConn.on('error', err => {
+            logStatus('Chyba Media Streamu: ' + err);
+            console.error(err);
+            stopMediaStream();
+          });
+
+          sendControlMessage({ type: 'play', currentTime: audioSource.currentTime });
+          logStatus('✅ Media stream zahájen k příjemci.');
+        } catch (e) {
+          logStatus('Chyba Web Audio API: ' + e.message);
+          console.error(e);
+          audioSource.pause();
+          stopMediaStream(false);
+        }
+      }, 100);
+    }
+
+    function stopMediaStream(sendControl = true) {
+      audioSource.pause();
+
+      if (sourceNode) try { sourceNode.disconnect(); } catch(e){}
+      if (destNode) try { destNode.disconnect(); } catch(e){}
+      sourceNode = null;
+      destNode = null;
+
+      if (mediaConn) {
+        try {
+          if (audioStreamSource) {
+            audioStreamSource.getTracks().forEach(t => t.stop());
+            audioStreamSource = null;
+          }
+          mediaConn.close();
+        } catch(e){}
+        mediaConn = null;
+      }
+
+      if (sendControl) sendControlMessage({ type: 'pause', currentTime: audioSource.currentTime });
+      logStatus('Media stream ukončen.');
+    }
+
+    audioSource.onended = () => {
+      stopMediaStream(false);
+      if (currentTrackIndex + 1 < playlist.length) {
+        playTrack(currentTrackIndex + 1, 0);
+        startMediaStream();
+        sendTrackIndex(currentTrackIndex, 0);
+      } else {
+        logStatus('Playlist dohrán.');
+      }
+    };
+
+    // --- Playlist / file handling ---
+    audioFileInput.addEventListener('change', () => {
+      addToPlaylistBtn.disabled = audioFileInput.files.length === 0;
+    });
+
+    addToPlaylistBtn.addEventListener('click', () => {
+      const files = audioFileInput.files;
+      for (let i = 0; i < files.length; i++) {
+        const file = files[i];
+        const url = URL.createObjectURL(file);
+        playlist.push({ name: file.name, url });
+      }
+      streamUrlInput.value = '';
+      updatePlaylistUI();
+      savePlaylistToLocal();
+      addToPlaylistBtn.disabled = true;
+      audioFileInput.value = '';
+    });
+
+    startPlaylistBtn.addEventListener('click', () => {
+      if (playlist.length > 0) {
+        audioSource.crossOrigin = null;
+        playTrack(0, 0);
+        startMediaStream();
+        sendTrackIndex(0, 0);
+      }
+    });
+
+    // --- Data channel helpers ---
+    function sendTrackIndex(index, currentTime = 0) {
+      if (conn && conn.open) conn.send({ type: 'playTrack', index, currentTime });
+    }
+    function sendControlMessage(msg) {
+      if (conn && conn.open) conn.send(msg);
+    }
+
+    function sendTimeSync(connection) {
+      if (!connection || !connection.open) return;
+      const syncInterval = setInterval(() => {
+        if (!connection.open) { clearInterval(syncInterval); return; }
+        if (!audioSource.paused) connection.send({ type: 'timeSync', senderTime: audioSource.currentTime });
+      }, 1000);
+      connection.on('close', () => clearInterval(syncInterval));
+    }
+
+    function handleTimeSync(data) {
+      if (audioReceiver.srcObject && !audioReceiver.paused) {
+        const senderTime = data.senderTime;
+        const receiverTime = audioReceiver.currentTime;
+        const drift = receiverTime - senderTime;
+        const driftFormatted = drift.toFixed(2);
+        if (Math.abs(drift) > 0.5) {
+          logStatus('⚠️ Synchronizace: odchylka ' + driftFormatted + 's — opravím.');
+          try { audioReceiver.currentTime = senderTime; } catch(e){}
+        } else {
+          logStatus('✅ Synchronizace: odchylka ' + driftFormatted + 's (v toleranci).');
+        }
+      }
+    }
+
+    function handleDataMessage(data) {
+      if (!data || !data.type) return;
+      switch(data.type) {
+        case 'playTrack':
+          if (typeof data.index === 'number') setRemoteTrackIndex(data.index, data.currentTime || 0);
+          break;
+        case 'play':
+          if (roleSelect.value === 'receiver' && audioReceiver.srcObject) {
+            audioReceiver.play().catch(e => {
+              unmuteBtn.style.display = 'block';
+              logStatus('Přehrávání zablokováno. Klikněte pro povolení zvuku!');
+              updateReceiverControls(false);
+            });
+            updateReceiverControls(true);
+          } else if (roleSelect.value === 'sender') {
+            startMediaStream();
+          }
+          break;
+        case 'pause':
+          if (roleSelect.value === 'receiver') {
+            audioReceiver.pause();
+            updateReceiverControls(false);
+          } else if (roleSelect.value === 'sender') {
+            stopMediaStream();
+          }
+          break;
+        case 'prev':
+          if (roleSelect.value === 'sender' && currentTrackIndex > 0) {
+            stopMediaStream();
+            playTrack(currentTrackIndex - 1, 0);
+            startMediaStream();
+            sendTrackIndex(currentTrackIndex - 1, 0);
+          }
+          break;
+        case 'next':
+          if (roleSelect.value === 'sender' && currentTrackIndex + 1 < playlist.length) {
+            stopMediaStream();
+            playTrack(currentTrackIndex + 1, 0);
+            startMediaStream();
+            sendTrackIndex(currentTrackIndex + 1, 0);
+          }
+          break;
+        case 'timeSync':
+          if (roleSelect.value === 'receiver') handleTimeSync(data);
+          break;
+      }
+    }
+
+    // --- Controls (sender local) ---
+    prevBtn.onclick = () => {
+      if (currentTrackIndex > 0) {
+        stopMediaStream();
+        playTrack(currentTrackIndex - 1, 0);
+        startMediaStream();
+        sendTrackIndex(currentTrackIndex, 0);
+      }
+    };
+    playBtn.onclick = () => {
+      if (currentTrackIndex === -1 && playlist.length > 0) playTrack(0,0);
+      startMediaStream();
+    };
+    pauseBtn.onclick = () => stopMediaStream();
+    nextBtn.onclick = () => {
+      if (currentTrackIndex + 1 < playlist.length) {
+        stopMediaStream();
+        playTrack(currentTrackIndex + 1, 0);
+        startMediaStream();
+        sendTrackIndex(currentTrackIndex, 0);
+      }
+    };
+
+    // --- Controls (receiver) ---
+    prevBtnR.onclick = () => { if (conn && currentTrackIndex > 0) sendControlMessage({ type: 'prev' }); };
+    playBtnR.onclick = () => {
+      if (conn) sendControlMessage({ type: 'play' });
+      if (audioReceiver.srcObject) {
+        audioReceiver.play().catch(e => { unmuteBtn.style.display = 'block'; logStatus('Přehrávání zablokováno. Interakce nutná.'); updateReceiverControls(false); });
+        updateReceiverControls(true);
+      }
+    };
+    pauseBtnR.onclick = () => { if (conn) sendControlMessage({ type: 'pause' }); };
+    nextBtnR.onclick = () => { if (conn && currentTrackIndex + 1 < playlist.length) sendControlMessage({ type: 'next' }); };
+
+    function updateReceiverControls(isPlaying) {
+      const connected = !!conn;
+      const hasNext = currentTrackIndex + 1 < playlist.length;
+      const hasPrev = currentTrackIndex > 0;
+      prevBtnR.disabled = !connected || !hasPrev;
+      playBtnR.disabled = !connected || isPlaying;
+      pauseBtnR.disabled = !connected || !isPlaying;
+      nextBtnR.disabled = !connected || !hasNext;
+    }
+
+    unmuteBtn.onclick = () => {
+      if (audioReceiver.srcObject) {
+        audioReceiver.play().then(() => {
+          logStatus('Zvuk odblokován gestem.');
+          unmuteBtn.style.display = 'none';
+          updateReceiverControls(true);
+          if (conn) sendControlMessage({ type: 'play' });
+        }).catch(e => logStatus('Nelze odblokovat zvuk: ' + e.message));
+      }
+    };
+
+    // --- PeerJS: startSender (s fallback cycling peerjs hosts) ---
+    const peerConfigs = [
+      { host: '0.peerjs.com', port: 443, secure: true },
+      { host: '1.peerjs.com', port: 443, secure: true },
+      { host: '2.peerjs.com', port: 443, secure: true }
+    ];
+
+    function startSender(peerId) {
+      if (peerJs) { try { peerJs.destroy(); } catch(e){} peerJs = null; }
+      qrcodeContainer.style.display = 'none';
+      document.getElementById('qrcode').innerHTML = '';
+
+      function tryNext() {
+        if (peerIndex >= peerConfigs.length) { logStatus('Nelze se připojit k žádnému PeerJS serveru.'); peerIndex = 0; return; }
+        const base = peerConfigs[peerIndex];
+        const cfg = { ...base, config: getIceConfig() };
+        logStatus('Zkouším PeerJS server: ' + base.host);
+        try {
+          peerJs = new Peer(peerId, cfg);
+        } catch (e) {
+          logStatus('Chyba inicializace Peer: ' + e);
+          peerIndex++; tryNext(); return;
+        }
+        let opened = false;
+        const errorTimeout = setTimeout(() => {
+          if (!opened) { logStatus('Timeout na ' + base.host); try { peerJs.destroy(); } catch(e){} peerJs = null; peerIndex++; tryNext(); }
+        }, 8000);
+
+        peerJs.on('open', id => {
+          opened = true; clearTimeout(errorTimeout);
+          logStatus('✅ Vysílač Peer ID: ' + id + ' (server: ' + base.host + ')');
+          // generuj qrcode
+          const qrcodeEl = document.getElementById('qrcode');
+          qrcodeEl.innerHTML = '';
+          new QRCode(qrcodeEl, { text: id, width: 180, height: 180 });
+          peerIdDisplay.textContent = 'Naskenujte kód: ' + id;
+          qrcodeContainer.style.display = 'block';
+          copyIdBtn.onclick = () => { navigator.clipboard.writeText(id).then(()=>logStatus('Peer ID zkopírováno.')).catch(()=>logStatus('Nelze kopírovat.')); };
+          peerIndex = 0;
+          initPeerBtn.disabled = true;
+          addToPlaylistBtn.disabled = false;
+        });
+
+        peerJs.on('error', err => {
+          clearTimeout(errorTimeout);
+          logStatus('PeerJS chyba (' + base.host + '): ' + (err && err.message ? err.message : err));
+          try { peerJs.destroy(); } catch(e){}
+          peerJs = null;
+          peerIndex++; tryNext();
+        });
+
+        peerJs.on('connection', connection => {
+          conn = connection;
+          conn.on('open', () => { logStatus('Přijímač připojen (DataChannel). Zahajuji synchronizaci...'); sendTimeSync(conn); });
+          conn.on('data', handleDataMessage);
+          conn.on('close', () => { logStatus('Přijímač odpojen.'); conn = null; stopMediaStream(); qrcodeContainer.style.display = 'block'; });
+          conn.on('error', err => { logStatus('Chyba spojení: ' + err); console.error(err); });
+        });
+
+        peerJs.on('call', call => {
+          // ignorovat příchozí hovory (my voláme my)
+          try { call.answer(); call.close(); } catch(e){}
+        });
+      }
+
+      peerIndex = 0;
+      tryNext();
+    }
+
+    // --- PeerJS: startReceiver ---
+    function startReceiver() {
+      if (peerJs) { try { peerJs.destroy(); } catch(e){} peerJs = null; }
+      if (html5QrCode && html5QrCode.isScanning) {
+        try { html5QrCode.stop(); } catch(e){}
+      }
+      readerContainer.innerHTML = '<div id="reader"></div>';
+      const currentIceConfig = getIceConfig();
+
+      function tryNextReceiver() {
+        if (peerIndex >= peerConfigs.length) { logStatus('Nelze se připojit k žádnému PeerJS serveru (přijímač).'); peerIndex = 0; return; }
+        const base = peerConfigs[peerIndex];
+        const cfg = { ...base, config: currentIceConfig };
+        logStatus('Zkouším PeerJS server (Přijímač): ' + base.host);
+        try {
+          peerJs = new Peer(cfg);
+        } catch(e) {
+          logStatus('Chyba init peer (recv): ' + e);
+          peerIndex++; tryNextReceiver(); return;
+        }
+
+        let opened = false;
+        const errorTimeout = setTimeout(() => {
+          if (!opened) { logStatus('Timeout na ' + base.host); try { peerJs.destroy(); } catch(e){} peerJs = null; peerIndex++; tryNextReceiver(); }
+        }, 8000);
+
+        peerJs.on('open', id => {
+          opened = true; clearTimeout(errorTimeout);
+          logStatus('✅ Přijímač Peer ID: ' + id + ' (server: ' + base.host + ')');
+          peerIndex = 0;
+          updateReceiverControls(false);
+        });
+
+        peerJs.on('error', err => {
+          clearTimeout(errorTimeout);
+          logStatus('Chyba PeerJS přijímače (' + base.host + '): ' + (err && err.message ? err.message : err));
+          try { peerJs.destroy(); } catch(e){}
+          peerJs = null;
+          peerIndex++; tryNextReceiver();
+        });
+
+        peerJs.on('call', call => {
+          call.answer(null);
+          mediaConn = call;
+          if (call.peerConnection) {
+            call.peerConnection.oniceconnectionstatechange = () => {
+              logStatus('ICE Stav MediaConn (Přijímač): ' + call.peerConnection.iceConnectionState);
+            };
+          }
+          call.on('stream', remoteStream => {
+            logStatus('Přijat audio stream!');
+            audioReceiver.srcObject = remoteStream;
+            unmuteBtn.style.display = 'none';
+            audioReceiver.play().catch(e => { unmuteBtn.style.display = 'block'; logStatus('Přehrávání zablokováno. Klikni pro povolení zvuku.'); updateReceiverControls(false); });
+            updateReceiverControls(true);
+          });
+          call.on('close', () => { logStatus('Stream ukončen vysílačem.'); audioReceiver.srcObject = null; mediaConn = null; unmuteBtn.style.display = 'none'; updateReceiverControls(false); });
+          call.on('error', err => { logStatus('Chyba streamu: ' + err); console.error(err); audioReceiver.srcObject = null; mediaConn = null; unmuteBtn.style.display = 'none'; updateReceiverControls(false); });
+        });
+      }
+
+      peerIndex = 0;
+      tryNextReceiver();
+
+      connectBtn.onclick = () => {
+        if (!peerJs || !peerJs.open) { logStatus('PeerJS není inicializován/otevřen.'); return; }
+        if (conn) { conn.close(); conn = null; }
+        const senderId = peerIdInput.value.trim();
+        if (!senderId) { alert('Zadej Peer ID vysílače'); return; }
+
+        conn = peerJs.connect(senderId, { reliable: true, serialization: 'json', metadata: {} });
+        conn.on('open', () => { logStatus('Připojeno k vysílači (DataChannel).'); updateReceiverControls(true); });
+        conn.on('data', handleDataMessage);
+        conn.on('close', () => { logStatus('Spojení ukončeno.'); conn = null; updateReceiverControls(false); if (mediaConn) mediaConn.close(); });
+        conn.on('error', err => { logStatus('Chyba spojení: ' + err); console.error(err); });
+      };
+    }
+
+    // --- QR skenování & paste ---
+    scanQrBtn.onclick = () => {
+      if (html5QrCode && html5QrCode.isScanning) {
+        html5QrCode.stop().then(() => { readerContainer.innerHTML = '<div id="reader"></div>'; html5QrCode = null; }).catch(e => console.error(e));
+        return;
+      }
+      html5QrCode = new Html5Qrcode("reader");
+      const config = { fps: 10, qrbox: { width: 250, height: 250 } };
+      logStatus('Spouštím skener. Povolte přístup ke kameře...');
+      html5QrCode.start({ facingMode: "environment" }, config,
+        decodedText => {
+          peerIdInput.value = decodedText;
+          logStatus('QR kód naskenován: ' + decodedText);
+          html5QrCode.stop().then(() => { readerContainer.innerHTML = '<div id="reader"></div>'; html5QrCode = null; connectBtn.click(); }).catch(e=>console.error(e));
+        },
+        errorMessage => {}
+      ).catch(err => { logStatus('Chyba spuštění skeneru: ' + err); readerContainer.innerHTML = '<div id="reader"></div>'; html5QrCode = null; });
+    };
+
+    pasteIdBtn.onclick = () => {
+      navigator.clipboard.readText().then(text => {
+        if (text) { peerIdInput.value = text.trim(); logStatus('Peer ID vloženo ze schránky.'); connectBtn.click(); } else logStatus('Schránka prázdná.');
+      }).catch(err => { logStatus('Nelze číst schránku: ' + err); });
+    };
+
+    // --- Role select & init ---
+    roleSelect.addEventListener('change', () => {
+      if (peerJs) { try { peerJs.destroy(); } catch(e){} peerJs = null; }
+      stopMediaStream(false);
+      playlist = [];
+      currentTrackIndex = -1;
+      updatePlaylistUI();
+      showUI(roleSelect.value);
+      peerIndex = 0;
+      if (roleSelect.value === 'sender') { initPeerBtn.disabled = false; addToPlaylistBtn.disabled = true; } else { startReceiver(); }
+    });
+
+    // --- Init on load ---
+    showUI(roleSelect.value);
+    loadPlaylistFromLocal();
+    if (roleSelect.value === 'sender') { initPeerBtn.disabled = false; addToPlaylistBtn.disabled = true; } else { startReceiver(); }
+
+    initPeerBtn.onclick = () => {
+      const peerId = senderPeerIdInput.value.trim();
+      if (!peerId) { alert('Zadej vlastní Peer ID pro vysílač'); return; }
+      localStorage.setItem(SENDER_ID_KEY, peerId);
+      saveTurnCredentials();
+      startSender(peerId);
+    };
+
+    // --- addUrlToPlaylist (test + proxy) ---
+    addUrlToPlaylistBtn.addEventListener('click', async () => {
+      const originalUrl = streamUrlInput.value.trim();
+      if (!originalUrl) { logStatus('Zadejte URL streamu.'); return; }
+      logStatus('Testuji URL a veřejné proxy (až 8s)...');
+      let cleanUrl = originalUrl;
+      try { if (originalUrl.includes('%')) cleanUrl = decodeURIComponent(originalUrl); } catch(e){}
+      async function attemptLoadTest(url) {
+        return new Promise(resolve => {
+          const testAudio = new Audio();
+          testAudio.crossOrigin = "anonymous";
+          testAudio.src = url;
+          let timeout = setTimeout(() => { testAudio.removeEventListener('canplaythrough', success); testAudio.removeEventListener('error', error); resolve(false); }, 8000);
+          function success(){ clearTimeout(timeout); resolve(true); }
+          function error(){ clearTimeout(timeout); resolve(false); }
+          testAudio.addEventListener('canplaythrough', success, { once: true });
+          testAudio.addEventListener('error', error, { once: true });
+          testAudio.load();
+        });
+      }
+
+      let loadedUrl = null;
+      if (await attemptLoadTest(cleanUrl)) loadedUrl = cleanUrl;
+      if (!loadedUrl) {
+        for (const proxyBase of PROXIES) {
+          let proxyUrl = proxyBase;
+          if (proxyBase.includes('raw?url=')) proxyUrl += encodeURIComponent(cleanUrl); else if (proxyBase.includes('?')) proxyUrl += cleanUrl; else proxyUrl += cleanUrl;
+          if (await attemptLoadTest(proxyUrl)) { loadedUrl = proxyUrl; break; }
+        }
+      }
+
+      if (loadedUrl) {
+        playlist.push({ name: `[ICECAST/URL] ${originalUrl}`, url: loadedUrl });
+        updatePlaylistUI();
+        savePlaylistToLocal();
+        streamUrlInput.value = '';
+        logStatus('✅ URL přidána do playlistu: ' + (loadedUrl.length>80?loadedUrl.substring(0,80)+'...':loadedUrl));
+        if (currentTrackIndex === -1) playTrack(playlist.length -1, 0);
+      } else {
+        logStatus('🛑 Načtení URL selhalo i přes veřejné proxy.');
+      }
+    });
+
+    // --- Hotkeys / small UI wiring for audio file selection via button ---
+    addToPlaylistBtn.addEventListener('click', () => audioFileInput.click());
+
+    // --- End IIFE ---
+  })();
+  </script>
+</body>
+</html>
