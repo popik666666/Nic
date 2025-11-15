@@ -1,0 +1,556 @@
+<!DOCTYPE html>
+<html lang="cs">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Rozšířené WebRTC Rádio – playlist, synchronizace</title>
+<script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.2/dist/peerjs.min.js"></script>
+<style>
+  body {
+    background:#121212; color:#eee;
+    font-family: Arial, sans-serif;
+    padding: 20px;
+  }
+  h2 { margin-bottom: 10px; }
+  label, input, select, button {
+    font-size: 16px;
+    margin: 6px 4px 12px 0;
+  }
+  button {
+    cursor: pointer;
+  }
+  .panel {
+    background: #222;
+    padding: 15px;
+    border-radius: 8px;
+    margin-top: 12px;
+    max-width: 600px;
+  }
+  .playlist {
+    list-style: decimal;
+    padding-left: 20px;
+    margin: 8px 0 12px;
+    max-height: 180px;
+    overflow-y: auto;
+    background: #111;
+    border-radius: 6px;
+  }
+  .playlist li {
+    padding: 6px 8px;
+    cursor: pointer;
+    user-select: none;
+  }
+  .playlist li.active {
+    background: #0af;
+    color: #000;
+    font-weight: bold;
+  }
+  #status {
+    margin-top: 8px;
+    font-style: italic;
+  }
+  #audioFile, #streamUrl {
+    width: 100%;
+    max-width: 480px;
+  }
+  #player {
+    width: 100%;
+    margin-top: 8px;
+    outline: none;
+  }
+</style>
+</head>
+<body>
+
+<h2>Rozšířené WebRTC Rádio</h2>
+
+<label for="roleSelect">Vyber roli:</label>
+<select id="roleSelect">
+  <option value="sender">Vysílač</option>
+  <option value="receiver">Přijímač</option>
+</select>
+
+<div id="senderPanel" class="panel">
+  <h3>Vysílač – správa playlistu a ovládání</h3>
+
+  <label for="senderIdInput">Zadej Peer ID vysílače (unikátní):</label><br>
+  <input type="text" id="senderIdInput" placeholder="např. moje-radio-123" />
+
+  <button id="startSenderBtn">Start vysílače</button>
+
+  <hr>
+
+  <h4>Přidání souboru do playlistu:</h4>
+  <input type="file" id="audioFile" multiple accept="audio/*" />
+  <button id="addFileBtn">Přidat soubory</button>
+
+  <h4>Nebo přidat URL streamu (Icecast apod.):</h4>
+  <input type="text" id="streamUrl" placeholder="URL streamu" />
+  <button id="addUrlBtn">Přidat URL do playlistu</button>
+
+  <h4>Playlist:</h4>
+  <ul id="playlist" class="playlist"></ul>
+
+  <div>
+    <button id="prevBtn">⏮️ Předchozí</button>
+    <button id="playPauseBtn">▶️ Přehrát</button>
+    <button id="nextBtn">⏭️ Další</button>
+  </div>
+
+  <p id="status">Stav: čekám na start...</p>
+</div>
+
+<div id="receiverPanel" class="panel" style="display:none;">
+  <h3>Přijímač – připoj se a poslouchej</h3>
+
+  <label for="receiverIdInput">Zadej Peer ID vysílače:</label><br>
+  <input type="text" id="receiverIdInput" placeholder="např. moje-radio-123" />
+
+  <button id="connectReceiverBtn">Připojit</button>
+
+  <h4>Playlist (synchronizovaný):</h4>
+  <ul id="playlistReceiver" class="playlist"></ul>
+
+  <audio id="player" controls></audio>
+
+  <p id="receiverStatus">Stav: nepřipojeno</p>
+
+  <div>
+    <button id="prevBtnR">⏮️ Předchozí</button>
+    <button id="playPauseBtnR">▶️ Přehrát</button>
+    <button id="nextBtnR">⏭️ Další</button>
+  </div>
+</div>
+
+<script>
+  let roleSelect = document.getElementById('roleSelect');
+  let senderPanel = document.getElementById('senderPanel');
+  let receiverPanel = document.getElementById('receiverPanel');
+
+  roleSelect.addEventListener('change', () => {
+    if(roleSelect.value === 'sender'){
+      senderPanel.style.display = 'block';
+      receiverPanel.style.display = 'none';
+      resetState();
+    } else {
+      senderPanel.style.display = 'none';
+      receiverPanel.style.display = 'block';
+      resetState();
+    }
+  });
+
+  // --- COMMON VARIABLES ---
+  let peer = null;
+  let conn = null;
+
+  // --- SENDER VARIABLES ---
+  let playlist = [];
+  let currentTrackIndex = -1;
+  let audioSender = new Audio();
+  audioSender.crossOrigin = "anonymous";
+  audioSender.preload = "auto";
+  audioSender.loop = false;
+  let isPlaying = false;
+  let syncInterval = null;
+
+  // --- RECEIVER VARIABLES ---
+  let playlistReceiver = [];
+  let currentTrackIndexReceiver = -1;
+  let audioReceiver = document.getElementById('player');
+  audioReceiver.preload = "auto";
+
+  // UI ELEMENTS
+  const senderIdInput = document.getElementById('senderIdInput');
+  const startSenderBtn = document.getElementById('startSenderBtn');
+  const audioFileInput = document.getElementById('audioFile');
+  const addFileBtn = document.getElementById('addFileBtn');
+  const streamUrlInput = document.getElementById('streamUrl');
+  const addUrlBtn = document.getElementById('addUrlBtn');
+  const playlistEl = document.getElementById('playlist');
+  const statusEl = document.getElementById('status');
+
+  const receiverIdInput = document.getElementById('receiverIdInput');
+  const connectReceiverBtn = document.getElementById('connectReceiverBtn');
+  const playlistReceiverEl = document.getElementById('playlistReceiver');
+  const receiverStatusEl = document.getElementById('receiverStatus');
+
+  const prevBtn = document.getElementById('prevBtn');
+  const playPauseBtn = document.getElementById('playPauseBtn');
+  const nextBtn = document.getElementById('nextBtn');
+
+  const prevBtnR = document.getElementById('prevBtnR');
+  const playPauseBtnR = document.getElementById('playPauseBtnR');
+  const nextBtnR = document.getElementById('nextBtnR');
+
+  // -- RESET --
+  function resetState() {
+    if(peer){
+      peer.destroy();
+      peer = null;
+    }
+    if(conn){
+      conn.close();
+      conn = null;
+    }
+    playlist = [];
+    currentTrackIndex = -1;
+    isPlaying = false;
+    clearInterval(syncInterval);
+    audioSender.pause();
+    audioSender.src = "";
+    playlistEl.innerHTML = "";
+    playlistReceiverEl.innerHTML = "";
+    receiverStatusEl.textContent = "Stav: nepřipojeno";
+    statusEl.textContent = "Stav: čekám na start...";
+    updatePlayPauseButton();
+    updatePlayPauseButtonR();
+  }
+
+  // --- SENDER FUNCTIONS ---
+
+  startSenderBtn.onclick = () => {
+    const id = senderIdInput.value.trim();
+    if(!id){
+      alert("Zadej Peer ID pro vysílač");
+      return;
+    }
+    startSender(id);
+  };
+
+  function startSender(id){
+    peer = new Peer(id, {
+      host:"peerjs.com",
+      port:443,
+      secure:true
+    });
+
+    peer.on('open', (peerId) => {
+      statusEl.textContent = "Vysílač aktivní s ID: " + peerId;
+      console.log("Vysílač Peer otevřen: " + peerId);
+    });
+
+    peer.on('connection', (connection) => {
+      conn = connection;
+      statusEl.textContent = "Připojen posluchač: " + conn.peer;
+
+      conn.on('data', (data) => {
+        if(data.type === 'control'){
+          handleControlFromReceiver(data.action);
+        } else if(data.type === 'requestPlaylist'){
+          sendPlaylist();
+        } else if(data.type === 'requestTrackIndex'){
+          sendCurrentTrack();
+        }
+      });
+
+      conn.on('close', () => {
+        statusEl.textContent = "Posluchač odpojen";
+        conn = null;
+      });
+
+      conn.on('error', (err) => {
+        console.error("Chyba spojení: ", err);
+      });
+    });
+  }
+
+  function addFiles(){
+    let files = audioFileInput.files;
+    if(files.length === 0){
+      alert("Vyberte alespoň jeden audio soubor");
+      return;
+    }
+    for(let f of files){
+      let url = URL.createObjectURL(f);
+      playlist.push({name: f.name, url});
+    }
+    if(currentTrackIndex === -1){
+      currentTrackIndex = 0;
+      loadTrack(currentTrackIndex);
+    }
+    updatePlaylistUI();
+  }
+  addFileBtn.onclick = addFiles;
+
+  addUrlBtn.onclick = () => {
+    let url = streamUrlInput.value.trim();
+    if(!url){
+      alert("Zadej URL streamu");
+      return;
+    }
+    playlist.push({name: url, url});
+    if(currentTrackIndex === -1){
+      currentTrackIndex = 0;
+      loadTrack(currentTrackIndex);
+    }
+    updatePlaylistUI();
+    streamUrlInput.value = "";
+  };
+
+  function updatePlaylistUI(){
+    playlistEl.innerHTML = "";
+    playlist.forEach((track, i) => {
+      let li = document.createElement("li");
+      li.textContent = track.name;
+      li.className = (i === currentTrackIndex) ? "active" : "";
+      li.onclick = () => {
+        loadTrack(i);
+        playAudio();
+      };
+      playlistEl.appendChild(li);
+    });
+  }
+
+  function loadTrack(index){
+    if(index < 0 || index >= playlist.length) return;
+    currentTrackIndex = index;
+    audioSender.src = playlist[index].url;
+    audioSender.load();
+    isPlaying = false;
+    updatePlaylistUI();
+    updatePlayPauseButton();
+    sendCurrentTrack();
+  }
+
+  function playAudio(){
+    if(currentTrackIndex === -1){
+      alert("Playlist je prázdný");
+      return;
+    }
+    audioSender.play();
+    isPlaying = true;
+    updatePlayPauseButton();
+    startSync();
+  }
+
+  function pauseAudio(){
+    audioSender.pause();
+    isPlaying = false;
+    updatePlayPauseButton();
+  }
+
+  function togglePlayPause(){
+    if(isPlaying){
+      pauseAudio();
+      sendControl("pause");
+    } else {
+      playAudio();
+      sendControl("play");
+    }
+  }
+
+  playPauseBtn.onclick = togglePlayPause;
+
+  prevBtn.onclick = () => {
+    if(currentTrackIndex > 0){
+      loadTrack(currentTrackIndex -1);
+      playAudio();
+      sendControl("prev");
+    }
+  };
+
+  nextBtn.onclick = () => {
+    if(currentTrackIndex + 1 < playlist.length){
+      loadTrack(currentTrackIndex + 1);
+      playAudio();
+      sendControl("next");
+    }
+  };
+
+  // --- SENDER COMMUNICATION ---
+  function sendControl(action){
+    if(conn && conn.open){
+      conn.send({type: 'control', action});
+    }
+  }
+
+  function sendCurrentTrack(){
+    if(conn && conn.open){
+      conn.send({type:'trackChange', index: currentTrackIndex});
+    }
+  }
+
+  function sendPlaylist(){
+    if(conn && conn.open){
+      conn.send({type:'playlist', playlist});
+    }
+  }
+
+  // --- SYNC TIME ---
+  function startSync(){
+    if(syncInterval) clearInterval(syncInterval);
+    syncInterval = setInterval(() => {
+      if(conn && conn.open && !audioSender.paused){
+        conn.send({type: 'timeUpdate', time: audioSender.currentTime});
+      }
+    }, 1000);
+  }
+
+  // --- HANDLE COMMANDS FROM RECEIVER ---
+  function handleControlFromReceiver(action){
+    if(action === 'play'){
+      playAudio();
+    } else if(action === 'pause'){
+      pauseAudio();
+    } else if(action === 'next'){
+      nextBtn.onclick();
+    } else if(action === 'prev'){
+      prevBtn.onclick();
+    }
+  }
+
+  // --- RECEIVER FUNCTIONS ---
+
+  connectReceiverBtn.onclick = () => {
+    const targetId = receiverIdInput.value.trim();
+    if(!targetId){
+      alert("Zadej Peer ID vysílače");
+      return;
+    }
+    startReceiver(targetId);
+  };
+
+  function startReceiver(targetId){
+    peer = new Peer(null, {
+      host:"peerjs.com",
+      port:443,
+      secure:true
+    });
+
+    peer.on('open', () => {
+      receiverStatusEl.textContent = "Připojuji se k " + targetId;
+      conn = peer.connect(targetId);
+
+      conn.on('open', () => {
+        receiverStatusEl.textContent = "Připojeno k " + targetId;
+        requestPlaylist();
+        requestTrackIndex();
+      });
+
+      conn.on('data', (data) => {
+        if(data.type === 'playlist'){
+          playlistReceiver = data.playlist;
+          updatePlaylistUIReceiver();
+        } else if(data.type === 'trackChange'){
+          loadTrackReceiver(data.index);
+        } else if(data.type === 'timeUpdate'){
+          syncAudioTime(data.time);
+        }
+      });
+
+      conn.on('close', () => {
+        receiverStatusEl.textContent = "Spojení ukončeno";
+      });
+
+      conn.on('error', (err) => {
+        console.error("Chyba spojení:", err);
+      });
+    });
+  }
+
+  function requestPlaylist(){
+    if(conn && conn.open){
+      conn.send({type: 'requestPlaylist'});
+    }
+  }
+  function requestTrackIndex(){
+    if(conn && conn.open){
+      conn.send({type:'requestTrackIndex'});
+    }
+  }
+
+  function updatePlaylistUIReceiver(){
+    playlistReceiverEl.innerHTML = "";
+    playlistReceiver.forEach((track,i) => {
+      let li = document.createElement("li");
+      li.textContent = track.name;
+      li.className = i === currentTrackIndexReceiver ? "active" : "";
+      li.onclick = () => {
+        if(conn && conn.open){
+          conn.send({type: 'control', action: 'trackSelect', index: i});
+        }
+      };
+      playlistReceiverEl.appendChild(li);
+    });
+  }
+
+  function loadTrackReceiver(index){
+    if(index < 0 || index >= playlistReceiver.length) return;
+    currentTrackIndexReceiver = index;
+    audioReceiver.src = playlistReceiver[index].url;
+    audioReceiver.currentTime = 0;
+    audioReceiver.play();
+    updatePlaylistUIReceiver();
+    updatePlayPauseButtonR();
+    receiverStatusEl.textContent = `Hraje skladba: ${playlistReceiver[index].name}`;
+  }
+
+  function syncAudioTime(time){
+    if(audioReceiver && !audioReceiver.paused){
+      let drift = audioReceiver.currentTime - time;
+      if(Math.abs(drift) > 0.5){
+        audioReceiver.currentTime = time;
+      }
+    }
+  }
+
+  // -- RECEIVER CONTROL BUTTONS --
+
+  let isPlayingReceiver = false;
+
+  function updatePlayPauseButtonR(){
+    playPauseBtnR.textContent = isPlayingReceiver ? "⏸️ Pauza" : "▶️ Přehrát";
+  }
+
+  playPauseBtnR.onclick = () => {
+    if(isPlayingReceiver){
+      audioReceiver.pause();
+      isPlayingReceiver = false;
+      sendControlFromReceiver('pause');
+    } else {
+      audioReceiver.play();
+      isPlayingReceiver = true;
+      sendControlFromReceiver('play');
+    }
+    updatePlayPauseButtonR();
+  };
+
+  prevBtnR.onclick = () => {
+    if(currentTrackIndexReceiver > 0){
+      currentTrackIndexReceiver--;
+      loadTrackReceiver(currentTrackIndexReceiver);
+      sendControlFromReceiver('prev');
+    }
+  };
+
+  nextBtnR.onclick = () => {
+    if(currentTrackIndexReceiver + 1 < playlistReceiver.length){
+      currentTrackIndexReceiver++;
+      loadTrackReceiver(currentTrackIndexReceiver);
+      sendControlFromReceiver('next');
+    }
+  };
+
+  function sendControlFromReceiver(action){
+    if(conn && conn.open){
+      conn.send({type:'control', action});
+    }
+  }
+
+  // --- UPDATE PLAY/PAUSE BUTTON (SENDER) ---
+  function updatePlayPauseButton(){
+    playPauseBtn.textContent = isPlaying ? "⏸️ Pauza" : "▶️ Přehraj";
+  }
+
+  // Inicializace podle role
+  if(roleSelect.value === 'sender'){
+    senderPanel.style.display = 'block';
+    receiverPanel.style.display = 'none';
+  } else {
+    senderPanel.style.display = 'none';
+    receiverPanel.style.display = 'block';
+  }
+</script>
+
+</body>
+</html>
