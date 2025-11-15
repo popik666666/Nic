@@ -1,0 +1,1246 @@
+<!DOCTYPE html>
+<html lang="cs">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Audio stream + playlist přes WebRTC s PeerJS a synchronizací</title>
+<style>
+  body { font-family: Arial, sans-serif; margin: 20px; background: #121212; color: #eee; }
+  h1 { margin-bottom: 10px; }
+  label[for="role"], #role { display: none; }
+  
+  button { 
+    padding: 10px 20px; 
+    background: #0b84ff; 
+    border: none; 
+    border-radius: 6px; 
+    color: white; 
+    cursor: pointer; 
+    margin-right: 5px; 
+    transition: background 0.2s;
+  }
+  button:hover:not(:disabled) { background: #0056b3; }
+  button:disabled { background: #555; cursor: not-allowed; }
+  
+  #status { margin-top: 15px; font-weight: bold; min-height: 1.5em; color: #0b84ff; }
+  
+  #playlist { 
+    margin-top: 10px; 
+    max-height: 200px; 
+    overflow-y: auto; 
+    border: 1px solid #555; 
+    padding: 5px; 
+    list-style-type: none;
+    background: #222; 
+    border-radius: 6px;
+  }
+  #playlist li { 
+    cursor: pointer; 
+    padding: 5px; 
+    margin-bottom: 2px; 
+    border-radius: 4px; 
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+  #playlist li:hover { background: #333; }
+  #playlist li.active { background: #0b84ff; color: #111; font-weight: bold; }
+
+  #playlist .track-info {
+    flex-grow: 1;
+  }
+
+  #playlist .remove-btn {
+    background: #ff0b3c;
+    color: white;
+    border: none;
+    border-radius: 4px;
+    padding: 3px 8px;
+    font-size: 0.9em;
+    cursor: pointer;
+    margin-left: 10px;
+    line-height: 1;
+  }
+  
+  input[type="text"], input[type="password"], input[type="file"] { 
+    padding: 8px; 
+    margin-top: 10px; 
+    background: #222; 
+    border: 1px solid #444; 
+    color: #eee; 
+    border-radius: 4px; 
+    width: 300px; 
+    box-sizing: border-box; 
+    display: block;
+    margin-bottom: 10px;
+  }
+  #streamUrlInput { width: 400px; }
+  
+  #unmuteBtn { 
+    background: #ff0b3c !important; 
+    display: none; 
+    margin: 15px auto; 
+    padding: 15px 30px; 
+    font-size: 1.2em; 
+    font-weight: bold; 
+    color: white;
+  }
+  #qrcodeContainer { 
+    background: white; 
+    padding: 15px; 
+    border-radius: 8px; 
+    display: inline-block; 
+    margin-top: 15px; 
+    text-align: center;
+  }
+  #peerIdDisplay { font-weight: bold; margin-bottom: 5px; color: #333; }
+  #readerContainer { margin-top: 15px; display: flex; justify-content: center; }
+  #controls button, #controlsReceiver button {
+      padding: 8px 15px;
+      margin-right: 8px;
+      display: inline-block;
+  }
+  
+  #audioSource, #audioReceiver { 
+    margin-top: 10px; 
+    width: 100%; 
+    outline: none; 
+    border-radius: 6px; 
+    background: #222; 
+  }
+
+  /* Vizuální indikátory */
+  .status-indicator {
+    display: inline-block;
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    margin-right: 5px;
+  }
+  .status-peerjs-offline { background-color: #ff0b3c; }
+  .status-peerjs-online { background-color: #28a745; }
+  .status-conn-disconnected { background-color: #ffc107; }
+  .status-conn-connected { background-color: #0b84ff; }
+</style>
+</head>
+<body>
+  <h1>WebRTC Audio Stream (PeerJS)</h1>
+
+  <label for="role">Vyber roli:</label>
+  <select id="role">
+    <option value="sender">Vysílač (stream audio)</option>
+    <option value="receiver">Přijímač (poslech)</option>
+  </select>
+  
+  <div id="senderUI" style="display:none;">
+    <h2>Vysílač – Streamování a Playlist</h2>
+    
+    <div style="margin-bottom: 10px;">
+        <span id="peerJsStatusIndicator" class="status-indicator status-peerjs-offline"></span>
+        <span id="connectionStatusIndicator" class="status-indicator status-conn-disconnected"></span>
+        <span id="senderStatusText">Offline</span>
+    </div>
+
+    <input type="text" id="streamUrlInput" placeholder="Zadejte URL streamu (např. http://icecast.com/stream.mp3)" />
+    <button id="addUrlToPlaylistBtn">Přidat URL do playlistu (Zkusit CORS Proxy)</button> 
+    
+    <hr style="border-color:#333; margin: 15px 0;">
+    
+    <input type="file" id="audioFileInput" accept="audio/*" multiple />
+    <button id="addToPlaylistBtn" disabled>Přidat soubor(y) do playlistu</button>
+    
+    <h3>Playlist</h3>
+    <ul id="playlist"></ul>
+    
+    <button id="startPlaylistBtn" disabled style="background:#28a745;">Start/Obnovit stream</button>
+    
+    <audio id="audioSource" controls></audio>
+    <div id="controls" style="margin-top:5px;">
+      <button id="prevBtn" disabled>⏮️ Předchozí</button>
+      <button id="playBtn" disabled>▶️ Play</button>
+      <button id="pauseBtn" disabled>⏸️ Pauza</button>
+      <button id="nextBtn" disabled>⏭️ Další</button>
+    </div>
+    
+    <hr style="border-color:#333; margin: 15px 0;">
+    <h3>Konfigurace PeerJS / TURN Serveru (Vaše tunely)</h3>
+    <p style="font-size: 0.9em; margin-top: 0;">Používá automatické STUN servery + veřejné a volitelně **VÁŠ** TURN server pro max. průchodnost.</p>
+    <input type="text" id="turnUrlInput" placeholder="TURN URL (např. turn:vas.server.com:3478)" />
+    <input type="text" id="turnUsernameInput" placeholder="TURN Uživatelské jméno" />
+    <input type="password" id="turnCredentialInput" placeholder="TURN Heslo/Kredenciál" />
+    
+    <p style="margin-top: 15px;">Vlastní **statické** Peer ID pro vysílač:</p>
+    <input id="senderPeerIdInput" type="text" placeholder="Zadej vlastní Peer ID (uloženo)" />
+    <button id="initPeerBtn" style="background:#ff6600;">Inicializovat Peer (vysílač)</button>
+    
+    <div id="qrcodeContainer" style="display:none;">
+        <p id="peerIdDisplay"></p>
+        <div id="qrcode"></div>
+        <button id="copyIdBtn" style="margin-top: 10px; background: #28a745;">Kopírovat ID</button>
+    </div>
+  </div>
+
+  <div id="receiverUI" style="display:none;">
+    <h2>Přijímač – Poslech a Připojení</h2>
+    <input type="text" id="peerIdInput" placeholder="Zadej statické Peer ID vysílače" />
+    <button id="connectBtn">Připojit</button>
+    <button id="pasteIdBtn" style="margin-top: 15px; background: #007bff;">Vložit ID ze schránky</button>
+    
+    <button id="scanQrBtn" style="margin-top: 15px;">Skenovat QR Kód</button>
+    <div id="readerContainer">
+        <div id="reader"></div>
+    </div>
+    
+    <div id="autoplayBlocker" style="text-align: center;">
+        <button id="unmuteBtn">KLIKNĚTE PRO POVOLENÍ ZVUKU</button>
+    </div>
+    
+    <audio id="audioReceiver" controls autoplay></audio>
+    <div id="controlsReceiver" style="margin-top:5px;">
+      <button id="prevBtnR" disabled>⏮️ Předchozí</button>
+      <button id="playBtnR" disabled>▶️ Play</button>
+      <button id="pauseBtnR" disabled>⏸️ Pauza</button>
+      <button id="nextBtnR" disabled>⏭️ Další</button>
+    </div>
+    
+    <h3>Playlist Vysílače</h3>
+    <ul id="receiverPlaylist">
+        <li style="color:#aaa;">(Bude synchronizován po připojení)</li>
+    </ul>
+
+  </div>
+
+  <div id="status"></div>
+
+  <script src="https://cdn.jsdelivr.net/npm/peerjs@1.4.7/dist/peerjs.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+  <script src="https://unpkg.com/html5-qrcode"></script>
+  <script>
+    // --- KONSTANTY PRO LOCAL STORAGE ---
+    const SENDER_ID_KEY = 'webrtc_sender_peer_id';
+    const PLAYLIST_KEY = 'webrtc_playlist';
+    // ----------------------------------
+
+    const roleSelect = document.getElementById('role');
+    const senderUI = document.getElementById('senderUI');
+    const receiverUI = document.getElementById('receiverUI');
+    const audioFileInput = document.getElementById('audioFileInput');
+    const addToPlaylistBtn = document.getElementById('addToPlaylistBtn');
+    const playlistEl = document.getElementById('playlist');
+    const receiverPlaylistEl = document.getElementById('receiverPlaylist'); // NOVÉ
+    const startPlaylistBtn = document.getElementById('startPlaylistBtn');
+    const audioSource = document.getElementById('audioSource');
+    const audioReceiver = document.getElementById('audioReceiver');
+    const statusDiv = document.getElementById('status');
+    const senderPeerIdInput = document.getElementById('senderPeerIdInput');
+    const initPeerBtn = document.getElementById('initPeerBtn');
+    const peerIdInput = document.getElementById('peerIdInput');
+    const connectBtn = document.getElementById('connectBtn');
+    
+    // --- NOVÉ PROMĚNNÉ ---
+    const streamUrlInput = document.getElementById('streamUrlInput');
+    const addUrlToPlaylistBtn = document.getElementById('addUrlToPlaylistBtn'); 
+    const unmuteBtn = document.getElementById('unmuteBtn');
+    const qrcodeContainer = document.getElementById('qrcodeContainer');
+    const peerIdDisplay = document.getElementById('peerIdDisplay');
+    const scanQrBtn = document.getElementById('scanQrBtn');
+    const readerContainer = document.getElementById('readerContainer');
+    const copyIdBtn = document.getElementById('copyIdBtn');
+    const pasteIdBtn = document.getElementById('pasteIdBtn');
+    let html5QrCode = null;
+    const turnUrlInput = document.getElementById('turnUrlInput');
+    const turnUsernameInput = document.getElementById('turnUsernameInput');
+    const turnCredentialInput = document.getElementById('turnCredentialInput');
+
+    const peerJsStatusIndicator = document.getElementById('peerJsStatusIndicator');
+    const connectionStatusIndicator = document.getElementById('connectionStatusIndicator');
+    const senderStatusText = document.getElementById('senderStatusText');
+    // ------------------------------------------
+
+    // Veřejné CORS proxy
+    const PROXIES = [
+        'https://corsproxy.io/?',
+        'https://api.allorigins.win/raw?url=',
+        'https://thingproxy.freeboard.io/fetch/',
+    ];
+
+    // Ovládací tlačítka
+    const prevBtn = document.getElementById('prevBtn');
+    const playBtn = document.getElementById('playBtn');
+    const pauseBtn = document.getElementById('pauseBtn');
+    const nextBtn = document.getElementById('nextBtn');
+    const prevBtnR = document.getElementById('prevBtnR');
+    const playBtnR = document.getElementById('playBtnR');
+    const pauseBtnR = document.getElementById('pauseBtnR');
+    const nextBtnR = document.getElementById('nextBtnR');
+
+    let peerJs = null;
+    let conn = null; // DataConnection
+    let mediaConn = null; // MediaConnection
+    let audioStreamSource = null; // MediaStream z vysílače
+    let audioContext = null; // Web Audio Context
+    
+    // Globální proměnné pro správu Web Audio grafu
+    let sourceNode = null; 
+    let destNode = null;   
+
+    let playlist = [];
+    let currentTrackIndex = -1;
+    let receiverPlaylist = []; // Playlist na straně přijímače
+
+    // 🔥 KONFIGURACE REDUNDANTNÍCH VEŘEJNÝCH PEERJS SIGNALIZAČNÍCH SERVERŮ (API tunelů)
+    const PEER_CONFIGS = [
+        { host: '0.peerjs.com', port: 443, secure: true, debug: 1, name: 'PeerJS Primary' },
+        { host: 'peerjs.evermeet.cz', port: 443, secure: true, debug: 1, name: 'PeerJS Czech Fallback' },
+        { host: 'peerjs-server.herokuapp.com', port: 443, secure: true, debug: 1, name: 'PeerJS Heroku Fallback' },
+    ];
+
+    // 🔥 FUNKCE PRO MAXIMÁLNÍ ROBUSTNOST ICE KONFIGURACE (TUNELY)
+    function getIceConfig() {
+      const customUrl = turnUrlInput.value.trim();
+      const customUsername = turnUsernameInput.value.trim();
+      const customCredential = turnCredentialInput.value.trim();
+      
+      let iceServers = [];
+      
+      // 1. VÁŠ VLASTNÍ TURN SERVER (PŘÍMÁ VOLBA TUNELU)
+      if (customUrl && customUsername && customCredential) {
+        logStatus('Používám vlastní TURN server pro konfiguraci ICE (priorita č. 1).');
+        iceServers.push({
+          urls: customUrl,
+          username: customUsername,
+          credential: customCredential
+        });
+      }
+      
+      // 2. VEŘEJNÉ STUN SERVERY (PRO HOST/SRFLX KANDIDÁTY - PŘÍMÉ SPOJENÍ)
+      iceServers.push(
+        { urls: 'stun:stun.l.google.com:19302' },
+        { urls: 'stun:stun1.l.google.com:19302' },
+        { urls: 'stun:stun2.l.google.com:19302' },
+        { urls: 'stun:stun.services.mozilla.com:3478' },
+        { urls: 'stun:stun.stunprotocol.org' }
+      );
+
+      // 3. VEŘEJNÉ TURN SERVERY (PRO RELAY KANDIDÁTY - PŘÍMÝ TUNEL JAKO FALLBACK)
+      iceServers.push(
+        { urls: 'turn:openrelay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
+        { urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' },
+        { urls: 'turn:openrelay.metered.ca:3478', username: 'openrelayproject', credential: 'openrelayproject' }
+      );
+      
+      return { 
+        iceTransportPolicy: 'all', 
+        iceServers: iceServers 
+      };
+    }
+    // ---------------------------------------------------
+    
+    function logStatus(msg) {
+      statusDiv.innerHTML = msg; 
+      console.log(msg.replace(/<[^>]*>?/gm, '')); 
+    }
+    
+    // Inicializace AudioContextu
+    function initAudioContext() {
+        if (!audioContext) {
+            try {
+                audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                logStatus('AudioContext inicializován.');
+            } catch (e) {
+                logStatus('🛑 Chyba inicializace AudioContext: ' + e.message);
+                return false;
+            }
+        }
+        
+        if (audioContext.state === 'suspended') {
+            audioContext.resume().catch(err => {
+                logStatus('AudioContext.resume() selhalo: ' + err.message);
+            });
+        }
+        return true;
+    }
+    
+    function savePlaylistToLocal() {
+        try {
+            // Ukládáme pouze stream URL, lokální soubory (blob:) nelze serializovat po reloadu
+            const serializablePlaylist = playlist.filter(track => !track.url.startsWith('blob:'));
+            localStorage.setItem(PLAYLIST_KEY, JSON.stringify(serializablePlaylist));
+        } catch (e) {
+            console.error('Chyba při ukládání playlistu:', e);
+        }
+    }
+
+    function loadPlaylistFromLocal() {
+        try {
+            const storedPlaylist = localStorage.getItem(PLAYLIST_KEY);
+            if (storedPlaylist) {
+                playlist = JSON.parse(storedPlaylist);
+                updatePlaylistUI();
+            }
+        } catch (e) {
+            console.error('Chyba při načítání playlistu:', e);
+        }
+
+        const storedSenderId = localStorage.getItem(SENDER_ID_KEY);
+        if (storedSenderId) {
+            senderPeerIdInput.value = storedSenderId;
+        }
+    }
+
+
+    function showUI(role) {
+      if (role === 'sender') {
+        senderUI.style.display = 'block';
+        receiverUI.style.display = 'none';
+        unmuteBtn.style.display = 'none'; 
+        qrcodeContainer.style.display = 'none';
+        logStatus('Režim Vysílač. Inicializujte Peer ID.');
+      } else {
+        senderUI.style.display = 'none';
+        receiverUI.style.display = 'block';
+        logStatus('Režim Přijímač. Připojte se k Vysílači.');
+      }
+    }
+    
+    function updatePlaylistUI(isReceiver = false, tracks = playlist) {
+      const targetEl = isReceiver ? receiverPlaylistEl : playlistEl;
+      targetEl.innerHTML = '';
+
+      if (tracks.length === 0) {
+          const li = document.createElement('li');
+          li.style.color = '#aaa';
+          li.textContent = isReceiver ? '(Žádný playlist, nebo nebyl synchronizován)' : '(Playlist je prázdný)';
+          targetEl.appendChild(li);
+          return;
+      }
+      
+      tracks.forEach((track, i) => {
+        const li = document.createElement('li');
+        const displayType = track.url.startsWith('blob:') ? 'Lokální soubor' : (track.proxyUrl ? 'STREAM (Proxy)' : 'STREAM (Direct)');
+        const displayDetail = track.proxyUrl || (track.url.length > 50 && !track.url.startsWith('blob:') ? track.url.substring(0, 50) + '...' : track.url);
+        
+        const trackInfo = document.createElement('span');
+        trackInfo.className = 'track-info';
+        trackInfo.innerHTML = `${i + 1}. **${track.name}** <span style="font-size: 0.8em; color: #bbb;">(${displayType})</span>`;
+
+        li.appendChild(trackInfo);
+
+        if (i === currentTrackIndex) li.classList.add('active');
+
+        if (!isReceiver) {
+            // Tlačítko pro odstranění (jen na straně Vysílače)
+            const removeBtn = document.createElement('button');
+            removeBtn.textContent = '❌';
+            removeBtn.className = 'remove-btn';
+            removeBtn.title = 'Odstranit z playlistu';
+            removeBtn.onclick = (e) => {
+                e.stopPropagation(); // Zabrání spuštění onclick na li
+                removeItemFromPlaylist(i);
+            };
+            li.appendChild(removeBtn);
+
+            // Nastavení přehrávání kliknutím (jen na straně Vysílače)
+            li.onclick = () => {
+              if (!initAudioContext()) return; 
+              stopMediaStream(false); 
+              playTrack(i);
+              sendTrackIndex(i, 0);
+              startMediaStream(); 
+              updateSenderControls(true); 
+            };
+        } else {
+             // Zobrazení aktuální URL na straně Přijímače
+             const urlSpan = document.createElement('span');
+             urlSpan.style.fontSize = '0.7em';
+             urlSpan.style.color = '#777';
+             urlSpan.textContent = displayDetail;
+             trackInfo.appendChild(document.createElement('br'));
+             trackInfo.appendChild(urlSpan);
+
+        }
+        
+        targetEl.appendChild(li);
+      });
+      
+      if (!isReceiver) {
+          const enabled = playlist.length > 0 && !!peerJs && peerJs.open;
+          startPlaylistBtn.disabled = !enabled;
+          updateSenderControls(!audioSource.paused); 
+      }
+    }
+
+    function removeItemFromPlaylist(index) {
+        if (index > -1) {
+            // Uvolnění objekt URL, pokud jde o lokální soubor
+            if (playlist[index].url.startsWith('blob:')) {
+                URL.revokeObjectURL(playlist[index].url);
+            }
+            playlist.splice(index, 1);
+            
+            // Aktualizace indexu, pokud byl smazán aktuálně přehrávaný
+            if (index === currentTrackIndex) {
+                currentTrackIndex = -1;
+                stopMediaStream(true);
+            } else if (index < currentTrackIndex) {
+                currentTrackIndex--;
+            }
+
+            updatePlaylistUI();
+            savePlaylistToLocal();
+            logStatus(`✅ Skladba #${index + 1} odstraněna z playlistu.`);
+        }
+    }
+
+
+    function updateSenderControls(isPlaying) {
+      const enabled = playlist.length > 0 && !!peerJs && peerJs.open;
+      const hasNext = currentTrackIndex + 1 < playlist.length;
+      const hasPrev = currentTrackIndex > 0;
+
+      prevBtn.disabled = !enabled || !hasPrev;
+      playBtn.disabled = !enabled || isPlaying;
+      pauseBtn.disabled = !enabled || !isPlaying;
+      nextBtn.disabled = !enabled || !hasNext;
+      startPlaylistBtn.disabled = !enabled || isPlaying;
+    }
+
+    function playTrack(index, currentTime = 0) {
+      if (index < 0 || index >= playlist.length) return;
+      currentTrackIndex = index;
+      const track = playlist[index];
+      
+      audioSource.crossOrigin = track.url.startsWith('blob:') ? null : "anonymous"; 
+      
+      audioSource.pause(); 
+      audioSource.src = track.url;
+      audioSource.currentTime = currentTime;
+      
+      audioSource.load();
+      
+      updatePlaylistUI();
+      logStatus(`▶️ Nastavena skladba #${index + 1}: ${track.name}`);
+    }
+
+    function setRemoteTrackIndex(index, currentTime = 0) {
+      if (index < 0 || index >= receiverPlaylist.length) return;
+      currentTrackIndex = index;
+      
+      updatePlaylistUI(true, receiverPlaylist); // Aktualizace playlistu příjemce
+      
+      logStatus(`Přijímač synchronizuje na skladbu #${index + 1}: ${receiverPlaylist[index].name}`);
+
+      if (audioReceiver.srcObject) {
+         audioReceiver.currentTime = currentTime; 
+      }
+      
+      if (audioReceiver.paused) {
+          audioReceiver.play().catch(() => {});
+      }
+      updateReceiverControls(!audioReceiver.paused); 
+    }
+
+    function modifySdpForOpus96(sdp) {
+      return sdp.replace(/a=fmtp:111 minptime=10;useinbandfec=1/g,
+        'a=fmtp:111 minptime=10;useinbandfec=1;maxaveragebitrate=96000;stereo=1');
+    }
+
+    async function startMediaStream() {
+        if (!conn || !conn.open) {
+          logStatus('Nelze streamovat, příjemce není připojen (DataChannel). ✅ Čekám na připojení...');
+          updateSenderControls(false);
+          return;
+        }
+        if (!audioSource.src) {
+          logStatus('Nelze streamovat, není vybrána žádná skladba.');
+          updateSenderControls(false);
+          return;
+        }
+
+        try {
+            if (!initAudioContext()) return; 
+            
+            // 🔥 POVOLENÍ AUDIO CONTEXTU ASYNCHRONNĚ
+            if (audioContext.state !== 'running') {
+                await audioContext.resume();
+            }
+
+            if (audioContext.state !== 'running') {
+                logStatus(`🛑 Chyba: AudioContext je ${audioContext.state}. Streamování selže.`);
+                audioSource.pause();
+                updateSenderControls(false);
+                return;
+            }
+
+            audioSource.pause(); 
+            // 🔥 POVOLENÍ PŘEHRÁVÁNÍ ASYNCHRONNĚ
+            await audioSource.play().catch(err => {
+              logStatus('🛑 Lokální přehrávání audio zablokováno. ' + err.message);
+              // Není fatální pro streamování, ale může být matoucí
+            });
+
+            if (sourceNode) sourceNode.disconnect();
+            if (destNode) destNode.disconnect();
+
+            sourceNode = audioContext.createMediaElementSource(audioSource);
+            destNode = audioContext.createMediaStreamDestination();
+
+            sourceNode.connect(destNode);
+            sourceNode.connect(audioContext.destination); 
+
+            audioStreamSource = destNode.stream;
+
+            if (mediaConn) {
+               mediaConn.close(); 
+               mediaConn = null;
+            }
+            mediaConn = peerJs.call(conn.peer, audioStreamSource);
+
+            mediaConn.on('negotiationneeded', () => {
+              const pc = mediaConn.peerConnection;
+              if (pc) {
+                const originalCreateOffer = pc.createOffer.bind(pc);
+                pc.createOffer = function() {
+                  return originalCreateOffer().then(offer => {
+                    offer.sdp = modifySdpForOpus96(offer.sdp);
+                    return offer;
+                  });
+                };
+              }
+            });
+
+            mediaConn.on('close', stopMediaStream);
+            mediaConn.on('error', err => {
+              logStatus('Chyba Media Streamu: ' + err);
+              stopMediaStream();
+            });
+
+            sendControlMessage({ type: 'play', currentTime: audioSource.currentTime });
+            logStatus('✅ Media stream zahájen k příjemci.');
+            updateSenderControls(true);
+          } catch (e) {
+            logStatus('Chyba při startu Web Audio API/Media: ' + e.message);
+            audioSource.pause();
+            stopMediaStream(false);
+          }
+    }
+
+    function stopMediaStream(sendControl = true) {
+      audioSource.pause();
+      
+      if (sourceNode) sourceNode.disconnect();
+      if (destNode) destNode.disconnect();
+      sourceNode = null;
+      destNode = null;
+
+      if (mediaConn) {
+        if (audioStreamSource) {
+            audioStreamSource.getTracks().forEach(track => track.stop());
+            audioStreamSource = null;
+        }
+        mediaConn.close();
+        mediaConn = null;
+      }
+
+      if (sendControl && conn && conn.open) {
+        sendControlMessage({ type: 'pause', currentTime: audioSource.currentTime });
+      }
+      logStatus('Media stream a lokální přehrávání zastaveno.');
+      updateSenderControls(false);
+    }
+
+    audioSource.onended = () => {
+      stopMediaStream(false);
+      if (currentTrackIndex + 1 < playlist.length) {
+        playTrack(currentTrackIndex + 1, 0);
+        startMediaStream();
+        sendTrackIndex(currentTrackIndex, 0);
+      } else {
+        logStatus('Playlist dohrán');
+      }
+    };
+
+    audioFileInput.addEventListener('change', () => {
+      addToPlaylistBtn.disabled = audioFileInput.files.length === 0;
+    });
+
+    addToPlaylistBtn.addEventListener('click', () => {
+      const files = audioFileInput.files;
+      for (let i = 0; i < files.length; i++) {
+        const file = files[i];
+        const url = URL.createObjectURL(file);
+        // Ukládáme jen základní info, proxyUrl je null
+        playlist.push({ name: file.name, url, proxyUrl: null }); 
+      }
+      streamUrlInput.value = ''; 
+      updatePlaylistUI();
+      savePlaylistToLocal();
+      addToPlaylistBtn.disabled = true;
+      audioFileInput.value = '';
+    });
+
+    startPlaylistBtn.addEventListener('click', () => {
+      if (!initAudioContext()) return; 
+      
+      if (playlist.length > 0) {
+        if (currentTrackIndex === -1 || audioSource.paused) { 
+            playTrack(0, 0);
+            sendTrackIndex(0, 0);
+        }
+        startMediaStream();
+      }
+    });
+
+    function sendTrackIndex(index, currentTime = 0) {
+      if (conn && conn.open) {
+        conn.send({ type: 'playTrack', index, currentTime });
+      }
+    }
+
+    function sendControlMessage(msg) {
+      if (conn && conn.open) {
+        conn.send(msg);
+      }
+    }
+    
+    // 🔥 NOVÁ FUNKCE: Odeslání celého playlistu příjemci
+    function sendPlaylistToReceiver() {
+        if (conn && conn.open) {
+            // Odešleme serializovatelné položky
+            const serializablePlaylist = playlist.map(item => ({
+                name: item.name,
+                url: item.url.startsWith('blob:') ? item.url.substring(0, 15) + '...' : item.url, // Zkrácení blob pro zprávu
+                proxyUrl: item.proxyUrl || null
+            }));
+
+            conn.send({ type: 'playlistSync', playlist: serializablePlaylist });
+            logStatus('✅ Playlist odeslán příjemci.');
+        }
+    }
+
+    function handleTimeSync(data) {
+        if (audioReceiver.srcObject && !audioReceiver.paused) {
+            const senderTime = data.senderTime;
+            const receiverTime = audioReceiver.currentTime;
+            const drift = receiverTime - senderTime; 
+            
+            const driftFormatted = drift.toFixed(2);
+            
+            // 🔥 Vylepšená synchronizace: Korekce rychlostí pro menší odchylky
+            const MAX_DRIFT_JUMP = 0.5;
+            const MAX_DRIFT_CORRECT = 0.15;
+
+            if (Math.abs(drift) > MAX_DRIFT_JUMP) { 
+                logStatus(`⚠️ Velká Odchylka ${driftFormatted}s. TVRDÁ OPRAVA.`);
+                audioReceiver.playbackRate = 1.0; 
+                audioReceiver.currentTime = senderTime; 
+            } else if (Math.abs(drift) > 0.05 && Math.abs(drift) < MAX_DRIFT_CORRECT) {
+                // Jemná korekce rychlostí
+                audioReceiver.playbackRate = 1.0 + (drift * -0.2); // Zrychlí, pokud je Receiver pozadu (kladný drift)
+                logStatus(`🟡 Jemná Korekce: Odchylka ${driftFormatted}s. Rate: ${audioReceiver.playbackRate.toFixed(3)}`);
+            } else {
+                audioReceiver.playbackRate = 1.0; 
+                logStatus(`✅ Synchronizace: Odchylka ${driftFormatted}s (v toleranci).`);
+            }
+        }
+    }
+
+    function handleDataMessage(data) {
+      if (!data.type) return;
+
+      switch(data.type) {
+        // 🔥 NOVÝ: Synchronizace playlistu
+        case 'playlistSync':
+            if (roleSelect.value === 'receiver' && data.playlist) {
+                receiverPlaylist = data.playlist;
+                updatePlaylistUI(true, receiverPlaylist);
+                logStatus(`✅ Přijat synchronizovaný playlist (${receiverPlaylist.length} skladeb).`);
+            }
+            break;
+        case 'playTrack':
+          if (typeof data.index === 'number') {
+            // Receiver používá lokální receiverPlaylist
+            if (roleSelect.value === 'receiver') {
+                setRemoteTrackIndex(data.index, data.currentTime || 0);
+            } else {
+                // Sender dostal playTrack, ale už by měl hrát, jen log
+                logStatus(`⚠️ Sender obdržel PlayTrack index. Ignorováno.`);
+            }
+          }
+          break;
+        case 'play':
+          if (roleSelect.value === 'receiver' && audioReceiver.srcObject) {
+            audioReceiver.play().catch(e => {
+              unmuteBtn.style.display = 'block'; 
+              logStatus('Přehrávání zablokováno. Klikněte pro povolení zvuku!');
+              updateReceiverControls(false);
+            });
+            updateReceiverControls(true);
+          } else if (roleSelect.value === 'sender') {
+             // Zajištění, že se stream spustí znovu, pokud byl pozastaven přijímačem
+             if (audioSource.paused) startMediaStream();
+          }
+          break;
+        case 'pause':
+          if (roleSelect.value === 'receiver') {
+            audioReceiver.pause();
+            updateReceiverControls(false);
+          } else if (roleSelect.value === 'sender') {
+            // Zajištění, že se stream zastaví
+            stopMediaStream();
+          }
+          break;
+        // 🔥 ŘÍZENÍ PLAYLISTU Z PŘIJÍMAČE
+        case 'prev':
+          if (roleSelect.value === 'sender') {
+            if (currentTrackIndex > 0) {
+              stopMediaStream();
+              playTrack(currentTrackIndex - 1, 0);
+              startMediaStream();
+              sendTrackIndex(currentTrackIndex, 0); 
+            } else { logStatus('Nelze přeskočit: První skladba (požadavek z přijímače).'); }
+          }
+          break;
+        case 'next':
+          if (roleSelect.value === 'sender') {
+            if (currentTrackIndex + 1 < playlist.length) {
+              stopMediaStream();
+              playTrack(currentTrackIndex + 1, 0);
+              startMediaStream();
+              sendTrackIndex(currentTrackIndex, 0); 
+            } else { logStatus('Nelze přeskočit: Poslední skladba (požadavek z přijímače).'); }
+          }
+          break;
+        case 'timeSync': 
+          if (roleSelect.value === 'receiver') {
+            handleTimeSync(data);
+          }
+          break;
+      }
+    }
+
+    // --- Ovládání ---
+    // (Sender controls remain unchanged, they operate locally and send sync messages)
+
+    prevBtnR.onclick = () => {
+      if (conn && conn.open) { 
+        sendControlMessage({ type: 'prev' }); 
+      } else { 
+        logStatus('❌ Nelze odeslat PŘEDCHOZÍ: Přijímač není připojen.'); 
+      }
+    };
+    
+    playBtnR.onclick = () => {
+      // Receiver send 'play' or tries to resume local audio if stream is active
+      if (conn && conn.open) { 
+        sendControlMessage({ type: 'play' }); 
+      } else if (audioReceiver.srcObject) {
+          audioReceiver.play().catch(e => {
+              unmuteBtn.style.display = 'block'; 
+              logStatus('Přehrávání zablokováno. Mobilní interakce nutná!');
+              updateReceiverControls(false);
+          });
+      }
+    };
+    
+    pauseBtnR.onclick = () => {
+      if (conn && conn.open) { 
+        sendControlMessage({ type: 'pause' }); 
+      } else { 
+        logStatus('❌ Nelze odeslat PAUZA: Přijímač není připojen.'); 
+      }
+    };
+    nextBtnR.onclick = () => {
+      if (conn && conn.open) { 
+        sendControlMessage({ type: 'next' }); 
+      } else { 
+        logStatus('❌ Nelze odeslat DALŠÍ: Přijímač není připojen.'); 
+      }
+    };
+    
+    function updateReceiverControls(isPlaying) {
+      const connected = !!conn;
+      
+      prevBtnR.disabled = !connected; 
+      playBtnR.disabled = !connected || isPlaying;
+      pauseBtnR.disabled = !connected || !isPlaying;
+      nextBtnR.disabled = !connected;
+    }
+    
+    unmuteBtn.onclick = () => {
+        if (audioReceiver.srcObject) {
+            audioReceiver.play().then(() => {
+                logStatus('Zvuk odblokován uživatelským gestem.');
+                unmuteBtn.style.display = 'none'; 
+                if (conn) sendControlMessage({ type: 'play' }); 
+            }).catch(e => {
+                 logStatus('Odblokování selhalo: ' + e.message);
+            });
+        }
+    };
+    
+    function updatePeerStatus(isOnline, peerId = '') {
+        if (roleSelect.value !== 'sender') return;
+        
+        peerJsStatusIndicator.classList.remove('status-peerjs-offline', 'status-peerjs-online');
+        peerJsStatusIndicator.classList.add(isOnline ? 'status-peerjs-online' : 'status-peerjs-offline');
+        
+        const connStatus = !!conn && conn.open;
+        connectionStatusIndicator.classList.remove('status-conn-disconnected', 'status-conn-connected');
+        connectionStatusIndicator.classList.add(connStatus ? 'status-conn-connected' : 'status-conn-disconnected');
+        
+        let statusText = isOnline ? `ONLINE (ID: ${peerId})` : 'Offline';
+        if (isOnline && connStatus) {
+            statusText += ' | Přijímač: ✅ PŘIPOJEN';
+        } else if (isOnline) {
+            statusText += ' | Přijímač: ❌ ODPOJEN';
+        }
+        senderStatusText.textContent = statusText;
+    }
+    
+    // 🔥 REKURZIVNÍ FUNKCE PRO PŘIPOJENÍ K SIGNALIZAČNÍMU SERVERU
+    function tryConnectToPeerServer(index, peerId) {
+        if (index >= PEER_CONFIGS.length) {
+            logStatus('❌ Selhalo připojení ke VŠEM dostupným PeerJS serverům (API tunelům). Zkontrolujte síť.');
+            initPeerBtn.disabled = false;
+            updatePeerStatus(false);
+            return;
+        }
+
+        const config = PEER_CONFIGS[index];
+        const currentIceConfig = getIceConfig(); 
+        const configWithIce = { ...config, config: currentIceConfig };
+        
+        logStatus(`Připojuji se k PeerJS serveru: ${config.name} (${config.host}). Pokus #${index + 1}...`);
+
+        if (peerJs) { peerJs.destroy(); peerJs = null; }
+        
+        peerJs = new Peer(peerId || null, configWithIce); 
+
+        peerJs.on('open', id => {
+            logStatus(`✅ Úspěšné připojení k ${config.name}. ID: ${id}`);
+            updatePeerStatus(true, id); // Aktualizace stavu
+            if (roleSelect.value === 'sender') {
+                handleSenderOpen(id);
+            } else {
+                handleReceiverOpen(id);
+            }
+        });
+
+        peerJs.on('error', err => {
+            logStatus(`❌ Chyba připojení k ${config.name}: ${err.message}. Zkouším další server...`);
+            updatePeerStatus(false);
+            tryConnectToPeerServer(index + 1, peerId);
+        });
+    }
+
+    // --- startSender ---
+    function startSender(peerId) {
+        if (peerJs) { peerJs.destroy(); peerJs = null; }
+        qrcodeContainer.style.display = 'none';
+        
+        tryConnectToPeerServer(0, peerId);
+    }
+    
+    function handleSenderOpen(id) {
+        const qrcodeEl = document.getElementById('qrcode');
+        qrcodeEl.innerHTML = '';
+        
+        new QRCode(qrcodeEl, { text: id, width: 180, height: 180, colorDark : "#000000", colorLight : "#ffffff", correctLevel : QRCode.CorrectLevel.H });
+        peerIdDisplay.textContent = `Naskenujte kód: ${id}`;
+        qrcodeContainer.style.display = 'block';
+        
+        copyIdBtn.onclick = () => {
+            navigator.clipboard.writeText(id).then(() => { logStatus('✅ Peer ID zkopírováno do schránky!'); }).catch(err => { logStatus('🛑 Nepodařilo se zkopírovat ID: ' + err); });
+        };
+        
+        initPeerBtn.disabled = true;
+        addToPlaylistBtn.disabled = false;
+        updatePlaylistUI();
+
+        peerJs.on('connection', connection => {
+            if (conn) { conn.close(); } 
+            conn = connection;
+            conn.on('open', () => { 
+              logStatus('Přijímač připojen (DataChannel). Zahajuji synchronizaci...');
+              updatePeerStatus(true, id); // Aktualizace stavu
+              sendPlaylistToReceiver(); // 🔥 NOVÉ: Odešli playlist
+              sendTimeSync(conn);
+              if(currentTrackIndex !== -1 && !audioSource.paused) {
+                 sendTrackIndex(currentTrackIndex, audioSource.currentTime);
+                 sendControlMessage({ type: 'play', currentTime: audioSource.currentTime });
+              }
+            });
+
+            conn.on('data', handleDataMessage);
+            conn.on('close', () => {
+              logStatus('Přijímač odpojen. ✅ Čekám na dalšího příjemce...');
+              conn = null;
+              if (mediaConn) mediaConn.close();
+              mediaConn = null;
+              qrcodeContainer.style.display = 'block'; 
+              updatePeerStatus(true, id); // Aktualizace stavu
+            });
+            conn.on('error', err => { logStatus('Chyba spojení: ' + err); console.error(err); updatePeerStatus(true, id); });
+        });
+
+        peerJs.on('call', call => {
+            logStatus('Ignorován příchozí hovor.');
+            call.answer();
+            call.close();
+        });
+    }
+    // --- KONEC startSender ---
+
+    // --- startReceiver ---
+    function startReceiver() {
+        if (peerJs) { peerJs.destroy(); peerJs = null; }
+        
+        if (html5QrCode && html5QrCode.isScanning) {
+            html5QrCode.stop().catch(err => console.log("Chyba při zastavování skeneru", err));
+        }
+        readerContainer.innerHTML = '<div id="reader"></div>';
+        
+        tryConnectToPeerServer(0, null);
+    }
+    
+    function handleReceiverOpen(id) {
+        logStatus(`✅ Přijímač Peer ID: ${id} připojen.`);
+        updateReceiverControls(false);
+        updatePlaylistUI(true, receiverPlaylist); // Reset/Zobrazení prázdného
+
+        peerJs.on('error', err => {
+            logStatus(`❌ Chyba PeerJS přijímače: ${err.message}. Zkuste obnovit stránku.`);
+        });
+
+        peerJs.on('call', call => {
+            if (mediaConn) mediaConn.close();
+            call.answer(null);
+            mediaConn = call;
+
+            call.on('stream', remoteStream => {
+              logStatus('Přijat Audio stream! (Očekávám Play signál)');
+              audioReceiver.srcObject = remoteStream;
+              unmuteBtn.style.display = 'none'; 
+              initAudioContext(); 
+            });
+
+            call.on('close', () => {
+              logStatus('Stream ukončen vysílačem.');
+              audioReceiver.srcObject = null;
+              mediaConn = null;
+              unmuteBtn.style.display = 'none';
+              updateReceiverControls(false);
+            });
+
+            call.on('error', err => { 
+                logStatus('Chyba streamu: ' + err); 
+                audioReceiver.srcObject = null; 
+                mediaConn = null; 
+                unmuteBtn.style.display = 'none'; 
+                updateReceiverControls(false); 
+            });
+        });
+
+        // Handler pro tlačítko "Připojit"
+        connectBtn.onclick = () => {
+            if (!peerJs || !peerJs.open) { logStatus('Nelze navázat spojení, PeerJS není inicializován/otevřen.'); return; }
+            if (conn) { conn.close(); conn = null; }
+            const senderId = peerIdInput.value.trim();
+            if (!senderId) { alert('Zadej Peer ID vysílače'); return; }
+            
+            conn = peerJs.connect(senderId, { reliable: true, serialization: 'json', metadata: {} });
+
+            conn.on('open', () => { 
+                logStatus('Připojeno k vysílači (DataChannel). Očekávám synchronizaci playlistu...'); 
+                updateReceiverControls(true); 
+                // Playlist sync se spustí automaticky na straně Sender
+            });
+            conn.on('data', handleDataMessage);
+            conn.on('close', () => { 
+                logStatus('Spojení ukončeno.'); 
+                conn = null; 
+                updateReceiverControls(false); 
+                if (mediaConn) mediaConn.close(); 
+            });
+            conn.on('error', err => { logStatus('Chyba spojení: ' + err); console.error(err); });
+        };
+        
+        const senderIdToConnect = peerIdInput.value.trim();
+        if (senderIdToConnect) {
+            logStatus(`Automaticky se připojuji k vysílači ID: ${senderIdToConnect}...`);
+            connectBtn.click(); 
+        }
+    }
+    // --- KONEC startReceiver ---
+
+    // --- LOGIKA PRO OBSLUHU TLAČÍTKA SKENOVÁNÍ A VKLÁDÁNÍ ---
+    scanQrBtn.onclick = () => {
+        if (html5QrCode && html5QrCode.isScanning) {
+            html5QrCode.stop().then(() => { readerContainer.innerHTML = '<div id="reader"></div>'; }).catch(err => console.error("Chyba při zastavování skeneru", err));
+            scanQrBtn.textContent = 'Skenovat QR Kód';
+            return;
+        }
+        scanQrBtn.textContent = 'Zastavit Skenování';
+
+        const config = { fps: 10, qrbox: { width: 250, height: 250 } };
+        html5QrCode = new Html5Qrcode("reader");
+        
+        logStatus('Spouštím skener. Povolte přístup ke kameře...');
+
+        html5QrCode.start({ facingMode: "environment" }, config, 
+            (decodedText) => {
+                peerIdInput.value = decodedText;
+                logStatus(`QR kód naskenován: ${decodedText}`);
+                
+                html5QrCode.stop().then(() => {
+                    readerContainer.innerHTML = '<div id="reader"></div>';
+                    html5QrCode = null;
+                    connectBtn.click(); 
+                    scanQrBtn.textContent = 'Skenovat QR Kód';
+                }).catch(err => console.error("Chyba při zastavování skeneru", err));
+            },
+            (errorMessage) => {})
+        .catch(err => { logStatus("🛑 Chyba spuštění skeneru. Povolte přístup ke kameře."); readerContainer.innerHTML = '<div id="reader"></div>'; html5QrCode = null; scanQrBtn.textContent = 'Skenovat QR Kód';});
+    };
+    
+    pasteIdBtn.onclick = () => {
+        navigator.clipboard.readText().then(text => {
+            if (text) {
+                peerIdInput.value = text.trim();
+                logStatus('✅ Peer ID vloženo ze schránky. Zkusím připojení...');
+                connectBtn.click();
+            } else { logStatus('🛑 Schránka je prázdná nebo neobsahuje text.'); }
+        }).catch(err => { logStatus('🛑 Nelze přistoupit ke schránce. Povolte přístup.'); console.error('Chyba čtení schránky:', err); });
+    };
+
+    // --- LOGIKA INICIALIZACE: Automatický výběr role ---
+    function autoInitRole() {
+        const urlParams = new URLSearchParams(window.location.search);
+        const urlRole = urlParams.get('role');
+        
+        let targetRole = 'sender'; 
+        if (urlRole && (urlRole === 'sender' || urlRole === 'receiver')) {
+            targetRole = urlRole;
+        }
+
+        roleSelect.value = targetRole; 
+        logStatus(`Automaticky vybrána role: ${targetRole.toUpperCase()}`);
+        
+        showUI(targetRole);
+        
+        if (targetRole === 'sender') {
+          initPeerBtn.disabled = false;
+          addToPlaylistBtn.disabled = true;
+        } else {
+          const peerIdParam = urlParams.get('peer');
+          if (peerIdParam) {
+              peerIdInput.value = peerIdParam.trim();
+              logStatus(`Nalezeno Peer ID v URL: ${peerIdParam}. Inicializuji příjemce.`);
+          }
+          startReceiver(); 
+        }
+    }
+    
+    // Spuštění hlavní inicializace
+    window.onload = () => {
+        loadPlaylistFromLocal();
+        autoInitRole(); 
+    };
+
+    initPeerBtn.onclick = () => {
+      const peerId = senderPeerIdInput.value.trim();
+      if (!peerId) { alert('Zadej vlastní statické Peer ID pro vysílač'); return; }
+      localStorage.setItem(SENDER_ID_KEY, peerId); 
+      startSender(peerId);
+    };
+    
+    // --- OBSLUHA TLAČÍTKA addUrlToPlaylistBtn (Icecast/Stream) ---
+    addUrlToPlaylistBtn.addEventListener('click', async () => {
+        const originalUrl = streamUrlInput.value.trim();
+        if (!originalUrl) { logStatus('Zadejte URL streamu (např. Icecast).'); return; }
+        
+        logStatus('Zkouším načíst URL stream a proxy. Může trvat až 8s...');
+        
+        const isEncoded = originalUrl.includes('%');
+        let cleanUrl = originalUrl;
+        if (isEncoded) { try { cleanUrl = decodeURIComponent(originalUrl); } catch(e) {} }
+        
+        async function attemptLoadTest(url) {
+            return new Promise(resolve => {
+                const testAudio = new Audio();
+                testAudio.crossOrigin = "anonymous"; 
+                testAudio.src = url;
+                
+                let timeout = setTimeout(() => {
+                    testAudio.removeEventListener('canplaythrough', handleSuccess);
+                    testAudio.removeEventListener('error', handleError);
+                    resolve(false);
+                }, 8000); 
+
+                function handleSuccess() {
+                    clearTimeout(timeout);
+                    resolve(true);
+                }
+
+                function handleError(e) {
+                    clearTimeout(timeout);
+                    console.warn(`Pokus o načtení selhal: ${url}`, e);
+                    resolve(false);
+                }
+
+                testAudio.addEventListener('canplaythrough', handleSuccess, { once: true });
+                testAudio.addEventListener('error', handleError, { once: true });
+                testAudio.load();
+            });
+        }
+        
+        const isSecureContext = window.location.protocol === 'https:';
+        const urlIsHttp = cleanUrl.startsWith('http://');
+        let loadedUrl = null;
+        let proxyUsed = false;
+
+        // 1. Přímý pokus (pokud není problém s HTTP/HTTPS)
+        if (!(isSecureContext && urlIsHttp)) {
+            if (await attemptLoadTest(cleanUrl)) { 
+                loadedUrl = cleanUrl; 
+            }
+        }
+        
+        // 2. Pokus s proxy, pokud přímý selhal nebo byl přeskočen
+        if (!loadedUrl) {
+            logStatus('Přímé načtení selhalo nebo bylo přeskočeno. Zkouším proxy...');
+            for (const proxyBase of PROXIES) {
+                let proxyUrl = proxyBase + (proxyBase.includes('raw?url=') ? encodeURIComponent(cleanUrl) : cleanUrl);
+                if (await attemptLoadTest(proxyUrl)) { 
+                    loadedUrl = proxyUrl; 
+                    proxyUsed = true;
+                    logStatus('✅ Nalezen funkční proxy server!');
+                    break; 
+                }
+            }
+        }
+        
+        if (loadedUrl) {
+            // 🔥 Ukládáme originální URL a použitou proxy/direct URL
+            playlist.push({ 
+                name: `[STREAM] ${originalUrl}`, 
+                url: loadedUrl, 
+                proxyUrl: proxyUsed ? loadedUrl : null 
+            });
+            updatePlaylistUI();
+            savePlaylistToLocal();
+            
+            streamUrlInput.value = ''; 
+            
+            logStatus(`✅ Externí URL přidána do playlistu. Použitý zdroj: ${proxyUsed ? 'Proxy' : 'Přímý'}`);
+            
+            if (currentTrackIndex === -1) { playTrack(playlist.length - 1, 0); }
+            
+        } else {
+            logStatus('🛑 Načtení externího streamu selhalo i přes veřejné proxy. URL streamu je nedostupná.');
+        }
+    });
+  </script>
+</body>
+</html>
